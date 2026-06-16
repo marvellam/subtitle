@@ -1,0 +1,12 @@
+project: example-course
+title: 示例课程
+speaker: ""
+root_dir: ""
+output_dir: runs
+output_mode: runs  # runs=project/runs/ | in_source=source_dir/{stem}_AI校对_{stamp}
+default_chunk_size: 100
+default_context_size: 10
+proofread_mode:
+  preserve_index: true
+  preserve_timestamp: true
+  preserve_block_count: true

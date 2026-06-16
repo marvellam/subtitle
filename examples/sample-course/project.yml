@@ -1,0 +1,13 @@
+project: sample-course
+title: sample-course
+description: Existing SRT subtitle proofreading project.
+output_dir: runs
+default_chunk_size: 100
+default_context_size: 10
+proofread_mode:
+  preserve_index: true
+  preserve_timestamp: true
+  preserve_block_count: true
+notes:
+  - Keep project-specific terms and feedback in this folder.
+  - The lexicon can start empty; add approved corrections after human review.

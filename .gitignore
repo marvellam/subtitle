@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Runtime/project artifacts
+subtitle-projects/
+*_字幕校对_*/
+runs/
+feedback/*.tmp.csv
+
+# Local outputs
+tmp/
+outputs/
+*.local.json
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Media/subtitle test files that may contain private data
+*.mp4
+*.mov
+*.m4v
+*.mp3
+*.wav
+*.m4a
+*.aac
+*.flac

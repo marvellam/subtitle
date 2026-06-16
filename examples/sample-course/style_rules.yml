@@ -1,0 +1,8 @@
+speech_cleanup:
+  remove_standalone_fillers: true
+  remove_sentence_final_fillers: conservative
+  mark_discourse_words_for_review: true
+editorial_rules:
+  preserve_speaker_meaning: true
+  do_not_rewrite_style_aggressively: true
+  do_not_change_timestamps: true
