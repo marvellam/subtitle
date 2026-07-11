@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import argparse
 import csv
+import collections
 import difflib
 import re
 from pathlib import Path
 
 
 TIME_RE = re.compile(r"^(\d{2}):(\d{2}):(\d{2}),(\d{3})\s+-->\s+(\d{2}):(\d{2}):(\d{2}),(\d{3})$")
+
+
+def csv_safe(value: object) -> object:
+    if isinstance(value, str) and value.startswith(("=", "+", "-", "@", "\t", "\r")):
+        return "'" + value
+    return value
 
 
 def read_text(path: Path) -> str:
@@ -74,11 +81,75 @@ def align(ai: list[dict[str, object]], manual: list[dict[str, object]], window: 
     return pairs, ai_only, manual_only
 
 
+def extract_term_candidates(
+    ai: list[dict[str, object]],
+    manual: list[dict[str, object]],
+    window_ms: int = 60_000,
+    max_chars: int = 12,
+) -> list[dict[str, str]]:
+    """Extract small text substitutions independently of SRT cue segmentation.
+
+    Human editors often merge or split cues. Comparing fixed time windows as continuous
+    text avoids treating those structural edits as terminology corrections.
+    """
+    def bucket(items: list[dict[str, object]]) -> dict[int, str]:
+        grouped: dict[int, list[str]] = collections.defaultdict(list)
+        for item in items:
+            midpoint = (int(item["start"]) + int(item["end"])) // 2
+            grouped[midpoint // window_ms].append(norm(str(item["text"])))
+        return {key: "".join(parts) for key, parts in grouped.items()}
+
+    ai_windows = bucket(ai)
+    manual_windows = bucket(manual)
+    counts: collections.Counter[tuple[str, str]] = collections.Counter()
+    for key in sorted(set(ai_windows) & set(manual_windows)):
+        before = ai_windows[key]
+        after = manual_windows[key]
+        matcher = difflib.SequenceMatcher(None, before, after)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag != "replace":
+                continue
+            wrong = before[i1:i2].strip()
+            correct = after[j1:j2].strip()
+            if not wrong or not correct or wrong == correct:
+                continue
+            if len(wrong) > max_chars or len(correct) > max_chars:
+                continue
+            if max(len(wrong), len(correct)) > max(1, min(len(wrong), len(correct))) * 4:
+                continue
+            counts[(wrong, correct)] += 1
+
+    rows: list[dict[str, str]] = []
+    for (wrong, correct), count in counts.most_common():
+        rows.append({
+            "wrong": wrong,
+            "correct": correct,
+            "category": "人工反馈候选",
+            "confidence": "review",
+            "condition": "",
+            "source_lesson": "",
+            "count": str(count),
+            "merge_decision": "",
+            "note": "cue-independent text diff; requires explicit human approval",
+        })
+    return rows
+
+
+def write_term_candidates(path: Path, rows: list[dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = ["wrong", "correct", "category", "confidence", "condition", "source_lesson", "count", "merge_decision", "note"]
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows({key: csv_safe(value) for key, value in row.items()} for row in rows)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ai-srt", required=True)
     parser.add_argument("--manual-srt", required=True)
     parser.add_argument("--out", required=True)
+    parser.add_argument("--terms-out", help="Optional cue-independent terminology candidate CSV. Defaults next to --out.")
     args = parser.parse_args()
     ai = parse_srt(read_text(Path(args.ai_srt)))
     manual = parse_srt(read_text(Path(args.manual_srt)))
@@ -109,8 +180,11 @@ def main() -> int:
     with out.open("w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["ai_index", "manual_index", "ai_timestamp", "manual_timestamp", "ai_text", "manual_text", "type", "candidate_wrong", "candidate_correct", "merge_decision", "note"])
         writer.writeheader()
-        writer.writerows(rows)
-    print(f"wrote {out} rows={len(rows)} pairs={len(pairs)} ai_only={len(ai_only)} manual_only={len(manual_only)}")
+        writer.writerows({key: csv_safe(value) for key, value in row.items()} for row in rows)
+    terms_out = Path(args.terms_out) if args.terms_out else out.with_name(f"{out.stem}_term_candidates.csv")
+    candidates = extract_term_candidates(ai, manual)
+    write_term_candidates(terms_out, candidates)
+    print(f"wrote {out} rows={len(rows)} pairs={len(pairs)} ai_only={len(ai_only)} manual_only={len(manual_only)} term_candidates={len(candidates)} terms_out={terms_out}")
     return 0
 
 

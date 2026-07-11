@@ -2,37 +2,24 @@ from __future__ import annotations
 
 import argparse
 import csv
-import html
+import hashlib
 import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+try:
+    import yaml
+except ImportError:  # pragma: no cover - surfaced with an actionable message at runtime
+    yaml = None
+
 
 TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2},\d{3}\s+-->\s+\d{2}:\d{2}:\d{2},\d{3}$")
 CORRUPT_TEXT_RE = re.compile(r"\?{4,}|�|锟")
-FILLER_ONLY = {"啊", "哈", "嗯", "呃", "哎", "唉", "额", "uh", "yeah", "okay", "ok", "hm", "hmm", "hm okay", "hmm okay"}
-SENTENCE_FINAL_FILLERS = ("啊", "哈", "嗯", "呃", "哎", "唉")
-DISCOURSE_WORDS = ("这个", "那个", "那么", "好不好")
-# A类清理：句首/句尾固定清除
-SENTENCE_START_REMOVE = ("好的", "好吧", "yeah", "okay", "ok", "uh", "hm", "hmm", "对", "是吧", "你看", "哎", "呃", "嗯", "啊", "哦")
-SENTENCE_END_REMOVE = ("你看", "是吧", "好不好", "哦")
-SENTENCE_START_FILLER = ("好",)
-
-# 合法叠词白名单（不压缩）
-VALID_REDUP = {"慢慢","轻轻","好好","厚厚","重重","紧紧","稳稳","明明",
-              "渐渐","茫茫","滚滚","滔滔","熊熊","炯炯","翩翩","天天",
-              "年年","人人","处处","时时","字字","句句","方方面面",
-              "冷冷","热热","软软","硬硬","粗粗","细细","厚厚","薄薄",
-              "长长","短短","远远","高高","低低","深深","浅浅","肥肥","瘦瘦",
-              "圆圆","正正","歪歪","直直","弯弯","多多","少少",
-              "白白","黑黑","红红","绿绿","蓝蓝","黄黄","紫紫","灰灰",
-              "纷纷","洋洋","凉凉","暖暖","爽爽",
-              "等等","哈哈","呵呵","嘿嘿","嘻嘻",
-              "亲亲","抱抱","瞧瞧","看看","试试","尝尝","想想",
-              "谢谢","仅仅",
-              "香香","甜甜","苦苦","辣辣","酸酸","咸咸"}
+DEFAULT_STANDALONE_FILLERS = ("啊", "哈", "嗯", "呃", "哎", "唉", "额", "uh", "yeah", "okay", "ok", "hm", "hmm")
+DEFAULT_REVIEW_WORDS = ("这个", "那个", "那么", "其实", "就是", "对吧", "是吧", "你看", "好不好")
+VALID_PHASE1_DECISIONS = {"accepted", "reverted", "adjusted"}
 
 
 
@@ -45,6 +32,9 @@ class LexiconRule:
     condition: str
     source_lesson: str
     note: str
+    status: str = "active"
+    verified_count: str = ""
+    last_verified: str = ""
 
 
 def read_text(path: Path) -> tuple[str, str]:
@@ -54,6 +44,67 @@ def read_text(path: Path) -> tuple[str, str]:
         except UnicodeDecodeError:
             continue
     raise UnicodeError(f"Cannot decode {path}")
+
+
+def load_yaml_file(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    if yaml is None:
+        raise RuntimeError("PyYAML is required to read project.yml/style_rules.yml. Install with: python -m pip install pyyaml")
+    data = yaml.safe_load(path.read_text(encoding="utf-8-sig"))
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected a YAML mapping in {path}")
+    return data
+
+
+def load_project_config(project: Path) -> dict:
+    return load_yaml_file(project / "project.yml")
+
+
+def load_style_rules(project: Path) -> dict:
+    return load_yaml_file(project / "style_rules.yml")
+
+
+def as_string_list(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, dict):
+        term = str(value.get("term", "")).strip()
+        return [term] if term else []
+    return []
+
+
+def timestamp_to_ms(value: str) -> tuple[int, int]:
+    numbers = [int(part) for part in re.findall(r"\d+", value)]
+    if len(numbers) != 8:
+        raise ValueError(f"Invalid timestamp: {value}")
+    start = ((numbers[0] * 60 + numbers[1]) * 60 + numbers[2]) * 1000 + numbers[3]
+    end = ((numbers[4] * 60 + numbers[5]) * 60 + numbers[6]) * 1000 + numbers[7]
+    return start, end
+
+
+def structural_errors(items: list[dict[str, str]]) -> list[dict[str, str]]:
+    errors: list[dict[str, str]] = []
+    expected = [str(i) for i in range(1, len(items) + 1)]
+    actual = [item["index"] for item in items]
+    if actual != expected:
+        errors.append({"type": "index_sequence_invalid", "value": f"expected 1..{len(items)}"})
+    previous_start = -1
+    for item in items:
+        try:
+            start, end = timestamp_to_ms(item["timestamp"])
+        except ValueError:
+            continue
+        if start >= end:
+            errors.append({"type": "timestamp_nonpositive", "value": item["timestamp"], "index": item["index"]})
+        if start < previous_start:
+            errors.append({"type": "timestamp_start_not_monotonic", "value": item["timestamp"], "index": item["index"]})
+        previous_start = start
+    return errors
 
 
 def parse_srt(text: str) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
@@ -83,6 +134,10 @@ def dump_srt(items: list[dict[str, str]]) -> str:
     return "\n\n".join(f"{it['index']}\n{it['timestamp']}\n{it['text']}" for it in items) + "\n"
 
 
+def items_fingerprint(items: list[dict[str, str]]) -> str:
+    return hashlib.sha256(dump_srt(items).encode("utf-8")).hexdigest()
+
+
 def load_lexicon(project: Path) -> list[LexiconRule]:
     path = project / "lexicon.csv"
     if not path.exists():
@@ -98,9 +153,12 @@ def load_lexicon(project: Path) -> list[LexiconRule]:
                 condition=(r.get("condition") or "").strip(),
                 source_lesson=(r.get("source_lesson") or "").strip(),
                 note=(r.get("note") or "").strip(),
+                status=(r.get("status") or "active").strip().lower(),
+                verified_count=(r.get("verified_count") or "").strip(),
+                last_verified=(r.get("last_verified") or "").strip(),
             )
             for r in rows
-            if (r.get("wrong") or "").strip()
+            if (r.get("wrong") or "").strip() and (r.get("status") or "active").strip().lower() not in {"disabled", "rejected"}
         ]
 
 
@@ -110,6 +168,21 @@ def load_blacklist(project: Path) -> list[dict[str, str]]:
         return []
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         return [dict(r) for r in csv.DictReader(f) if (r.get("term") or "").strip()]
+
+
+def load_protected_terms(project: Path, lexicon: list[LexiconRule] | None = None) -> list[str]:
+    terms: list[str] = []
+    path = project / "protected_terms.csv"
+    if path.exists():
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f):
+                term = (row.get("term") or "").strip()
+                if term:
+                    terms.append(term)
+    for rule in lexicon or load_lexicon(project):
+        if rule.wrong == rule.correct:
+            terms.append(rule.wrong)
+    return list(dict.fromkeys(terms))
 
 
 def context_text(items: list[dict[str, str]], pos: int, radius: int) -> str:
@@ -129,71 +202,101 @@ def apply_lexicon(text: str, ctx: str, rules: list[LexiconRule]) -> tuple[str, l
     current = text
     applied: list[dict[str, str]] = []
     reviews: list[dict[str, str]] = []
+    grouped: dict[str, list[LexiconRule]] = {}
     for rule in rules:
-        if rule.wrong not in current:
+        # wrong == correct is a canonical/protected term, not a replacement.
+        if rule.wrong == rule.correct or rule.status in {"disabled", "rejected"}:
             continue
-        if rule.confidence == "auto":
-            count = current.count(rule.wrong)
-            current = current.replace(rule.wrong, rule.correct)
-            applied.append({"old": rule.wrong, "new": rule.correct, "count": str(count), "category": rule.category, "risk": "low", "note": rule.note})
-        elif rule.confidence == "conditional":
-            if condition_met(rule.condition, ctx):
-                count = current.count(rule.wrong)
-                current = current.replace(rule.wrong, rule.correct)
-                applied.append({"old": rule.wrong, "new": rule.correct, "count": str(count), "category": rule.category, "risk": "medium", "note": rule.note})
-            else:
-                reviews.append({"term": rule.wrong, "suggestion": rule.correct, "category": rule.category, "risk": "medium", "note": f"condition not met: {rule.condition}"})
+        grouped.setdefault(rule.wrong, []).append(rule)
+
+    # Longer source phrases must run before shorter overlapping phrases.
+    for wrong in sorted(grouped, key=len, reverse=True):
+        if wrong not in current:
+            continue
+        candidates = grouped[wrong]
+        active_corrections = {rule.correct for rule in candidates}
+        certified = [rule for rule in candidates if rule.confidence == "auto" and rule.status in {"active", "certified"}]
+        certified_corrections = {rule.correct for rule in certified}
+        if len(active_corrections) == 1 and len(certified_corrections) == 1:
+            chosen = certified[0]
+            count = current.count(wrong)
+            current = current.replace(wrong, chosen.correct)
+            applied.append({
+                "old": wrong,
+                "new": chosen.correct,
+                "count": str(count),
+                "category": chosen.category,
+                "risk": "low" if chosen.confidence == "auto" else "medium",
+                "note": chosen.note,
+            })
+        elif len(active_corrections) > 1:
+            suggestions = " / ".join(sorted(active_corrections))
+            reviews.append({
+                "term": wrong,
+                "suggestion": suggestions,
+                "category": "词库冲突",
+                "risk": "high",
+                "note": "multiple lexicon corrections match this context; do not auto-replace",
+            })
         else:
-            reviews.append({"term": rule.wrong, "suggestion": rule.correct, "category": rule.category, "risk": "medium", "note": rule.note})
+            suggestions = " / ".join(dict.fromkeys(rule.correct for rule in candidates))
+            matched_conditions = [rule.condition for rule in candidates if rule.confidence == "conditional" and condition_met(rule.condition, ctx)]
+            reviews.append({
+                "term": wrong,
+                "suggestion": suggestions,
+                "category": candidates[0].category,
+                "risk": "medium",
+                "note": "candidate only; Agent must decide from context" + (f"; matched conditions: {' | '.join(matched_conditions)}" if matched_conditions else ""),
+            })
     return current, applied, reviews
 
 
-_SENTENCE_START_PATTERN = re.compile(r"^(好)(?!处|奇|久|像|比|转|在|画)")
-_SENTENCE_START_REMOVE = re.compile(r"^(" + "|".join(re.escape(w) for w in SENTENCE_START_REMOVE) + r")\s*")
-_SENTENCE_END_REMOVE = re.compile(r"\s*(" + "|".join(re.escape(w) for w in SENTENCE_END_REMOVE) + r")$")
-
-def cleanup_fillers(text: str) -> tuple[str, list[dict[str, str]], list[dict[str, str]]]:
+def cleanup_fillers(text: str, style_rules: dict | None = None) -> tuple[str, list[dict[str, str]], list[dict[str, str]]]:
+    style_rules = style_rules or {}
+    speech = style_rules.get("speech_fillers") or {}
+    standalone = set(as_string_list(speech.get("standalone_blank")) or DEFAULT_STANDALONE_FILLERS)
+    start_review = as_string_list(speech.get("sentence_start_review"))
+    end_review = as_string_list(speech.get("sentence_end_review"))
+    final_remove = as_string_list(speech.get("sentence_final_remove"))
     compact = re.sub(r"\s+", "", text)
     applied: list[dict[str, str]] = []
     reviews: list[dict[str, str]] = []
-    if compact in FILLER_ONLY:
+    if compact.lower() in {word.lower() for word in standalone}:
         return "", [{"old": text, "new": "", "count": "1", "category": "语气词", "risk": "low", "note": "standalone filler block"}], []
     current = text
-    for filler in SENTENCE_FINAL_FILLERS:
+    for filler in final_remove:
         pattern = re.compile(re.escape(filler) + r"([。！？!?，,、\s]*)$")
         if pattern.search(current):
-            current = pattern.sub(r"\1", current).rstrip()
-            applied.append({"old": filler, "new": "", "count": "1", "category": "语气词", "risk": "low", "note": "sentence-final filler"})
-            break
-    # 句首固定删除：好吧|对|是吧|你看
-    m = _SENTENCE_START_REMOVE.search(current)
-    if m:
-        current = current[m.end():].lstrip()
-        applied.append({"old": m.group(1), "new": "", "count": "1", "category": "句首语气词", "risk": "low", "note": "auto-delete sentence-start filler"})
-    # 句尾固定删除：你看|是吧（循环清除多个）
-    while True:
-        m = _SENTENCE_END_REMOVE.search(current)
-        if not m:
-            break
-        current = current[:m.start()].rstrip()
-        applied.append({"old": m.group(1), "new": "", "count": "1", "category": "句尾语气词", "risk": "low", "note": "auto-delete sentence-end filler"})
-    for word in DISCOURSE_WORDS:
-        if word in current:
-            reviews.append({"term": word, "suggestion": "", "category": "口语连接词", "risk": "low", "note": "mark for human review; do not delete automatically"})
+            reviews.append({"term": filler, "suggestion": "", "category": "句尾语气词", "risk": "medium", "note": "project-configured candidate; Agent must decide, do not delete mechanically"})
+    for word in start_review:
+        if current.startswith(word):
+            reviews.append({"term": word, "suggestion": "", "category": "句首口语词", "risk": "low", "note": "project-configured review; do not delete automatically"})
+    for word in end_review:
+        if re.search(re.escape(word) + r"[。！？!?，,、\s]*$", current):
+            reviews.append({"term": word, "suggestion": "", "category": "句尾口语词", "risk": "low", "note": "project-configured review; do not delete automatically"})
+    if not start_review and not end_review:
+        for word in DEFAULT_REVIEW_WORDS:
+            if word in current:
+                reviews.append({"term": word, "suggestion": "", "category": "口语连接词", "risk": "low", "note": "mark for contextual review; do not delete automatically"})
     return current, applied, reviews
 
 
 def cleanup_repeated_chars(text: str) -> tuple[str, list[dict[str, str]], list[dict[str, str]]]:
-    """Remove ASR stutter repetitions while preserving legitimate 叠词."""
-    applied: list[dict[str, str]] = []
-    current = text
-    # 3+ consecutive same chars → always reduce to 1
-    current = re.sub(r'(.)(\1{2,})', lambda m: m.group(1), current)
-    # 2 consecutive same chars → reduce if not in whitelist
-    current = re.sub(r'(.)(\1)', lambda m: m.group(0) if m.group(0) in VALID_REDUP else m.group(1), current)
-    if current != text:
-        applied.append({"old": text, "new": current, "count": "1", "category": "重复字", "risk": "low", "note": "ASR stutter cleanup"})
-    return current, applied, []
+    """Never collapse repeated Chinese characters mechanically.
+
+    Repetition may be a stutter, emphasis, a kinship term, or a legitimate reduplicated
+    word. Only long runs are surfaced for contextual review.
+    """
+    reviews: list[dict[str, str]] = []
+    if re.search(r"(.)\1{2,}", text):
+        reviews.append({
+            "term": text,
+            "suggestion": "",
+            "category": "重复字",
+            "risk": "medium",
+            "note": "three-or-more repeated characters; review in context, never auto-collapse",
+        })
+    return text, [], reviews
 
 
 _DIGIT_TO_CN = {
@@ -241,42 +344,6 @@ def scan_blacklist(items: list[dict[str, str]], blacklist: list[dict[str, str]])
     return hits
 
 
-def write_html(path: Path, title: str, summary: dict[str, object], rows: list[dict[str, str]]) -> None:
-    body_rows = []
-    for r in rows:
-        body_rows.append(
-            "<tr>"
-            f"<td>{html.escape(r.get('index',''))}</td>"
-            f"<td>{html.escape(r.get('timestamp',''))}</td>"
-            f"<td>{html.escape(r.get('risk',''))}</td>"
-            f"<td class='before'>{html.escape(r.get('before',''))}</td>"
-            f"<td class='after'>{html.escape(r.get('after',''))}</td>"
-            f"<td>{html.escape(r.get('rules',''))}</td>"
-            f"<td class='ctx'>{html.escape(r.get('context',''))}</td>"
-            "</tr>"
-        )
-    summary_html = "<br>".join(f"<b>{html.escape(str(k))}</b>: {html.escape(str(v))}" for k, v in summary.items())
-    doc = f"""<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><title>{html.escape(title)}</title>
-<style>
-body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;background:#f7f3ec;color:#1a1a1a;margin:32px;}}
-h1{{font-family:Georgia,"Times New Roman",serif;color:#8a6a32;}}
-.summary{{background:white;padding:16px 20px;border-left:4px solid #c9a96e;margin-bottom:20px;}}
-table{{border-collapse:collapse;width:100%;background:white;font-size:14px;}}
-th,td{{border:1px solid #e5ded2;padding:8px;vertical-align:top;}}
-th{{background:#1a1a1a;color:white;position:sticky;top:0;}}
-.before{{color:#8a1f11;white-space:pre-wrap;}}
-.after{{color:#11613a;white-space:pre-wrap;font-weight:600;}}
-.ctx{{font-size:12px;color:#666;}}
-</style></head><body>
-<h1>{html.escape(title)}</h1>
-<div class="summary">{summary_html}</div>
-<table><thead><tr><th>编号</th><th>时间轴</th><th>风险</th><th>原文</th><th>校对后</th><th>规则/疑点</th><th>上下文</th></tr></thead>
-<tbody>{''.join(body_rows)}</tbody></table>
-</body></html>"""
-    path.write_text(doc, encoding="utf-8")
-
-
 def phase1_audit_csv_path(src: Path) -> Path:
     stem = re.sub(r"_Phase1_机械校对$", "", src.stem)
     return src.with_name(f"{stem}_Phase1_机械修改与疑点.csv")
@@ -310,29 +377,9 @@ def load_phase1_audit(src: Path) -> dict[str, dict[str, str]]:
 
 LATIN_RE = re.compile(r"[A-Za-z]")
 MIXED_LATIN_CJK_RE = re.compile(r"(?:[A-Za-z]+[\u4e00-\u9fff]+|[\u4e00-\u9fff]+[A-Za-z]+)")
-SUSPICIOUS_ASR_TERMS = (
-    "yeah",
-    "okay",
-    "ok",
-    "hm",
-    "hmm",
-    "input",
-    "hold",
-    "go around",
-    "how",
-    "b档",
-    "B档",
-    "防棉",
-    "翳墨",
-    "笔录",
-    "光系",
-    "影帝",
-    "硬币",
-    "硬笔",
-)
 
 
-def detect_phase2_anomaly(item: dict[str, str], ctx: str) -> dict[str, str]:
+def detect_phase2_anomaly(item: dict[str, str], ctx: str, style_rules: dict | None = None) -> dict[str, str]:
     """Recall lines that need mandatory Phase 2 review even if Phase 1 made no edit.
 
     These are not automatic replacements. They are high-priority review signals for
@@ -341,24 +388,29 @@ def detect_phase2_anomaly(item: dict[str, str], ctx: str) -> dict[str, str]:
     """
     text_value = item.get("text", "")
     compact = re.sub(r"\s+", "", text_value)
+    style_rules = style_rules or {}
+    configured_terms = as_string_list(style_rules.get("asr_review_terms"))
     signals: list[str] = []
+    mandatory = False
     if LATIN_RE.search(compact):
         signals.append("latin_letters")
     if MIXED_LATIN_CJK_RE.search(compact):
         signals.append("mixed_latin_cjk")
+        mandatory = True
     lowered = compact.lower()
-    for term in SUSPICIOUS_ASR_TERMS:
+    for term in configured_terms:
         if term.lower() in lowered:
             signals.append(f"suspicious_asr:{term}")
+            mandatory = True
     if not signals:
         return {}
     return {
-        "risk": "high",
+        "risk": "high" if mandatory else "medium",
         "before": text_value,
         "after": text_value,
-        "rules": "Phase2 mandatory anomaly review: " + "; ".join(dict.fromkeys(signals)),
+        "rules": ("Phase2 mandatory anomaly review: " if mandatory else "Phase2 contextual review: ") + "; ".join(dict.fromkeys(signals)),
         "context": ctx,
-        "requires_phase2_decision": "true",
+        "requires_phase2_decision": "true" if mandatory else "false",
     }
 
 
@@ -394,9 +446,40 @@ def add_review_metadata(row: dict[str, str]) -> dict[str, str]:
     return enriched
 
 
-def export_ai_chunks(src: Path, items: list[dict[str, str]], chunk_size: int, context_size: int, project: str, out_path: Path) -> dict:
+def resolve_context_files(project: Path, project_config: dict) -> dict[str, list[str]]:
+    configured = as_string_list(project_config.get("context_files")) + as_string_list(project_config.get("materials"))
+    project_root = project.resolve()
+    inside_project: list[str] = []
+    external: list[str] = []
+    missing: list[str] = []
+    for value in dict.fromkeys(configured):
+        path = Path(value)
+        if not path.is_absolute():
+            path = project / path
+        resolved = path.resolve()
+        if not path.exists():
+            missing.append(str(resolved))
+        elif resolved == project_root or resolved.is_relative_to(project_root):
+            inside_project.append(str(resolved))
+        else:
+            external.append(str(resolved))
+    return {"inside_project": inside_project, "external_requires_approval": external, "missing": missing}
+
+
+def export_ai_chunks(
+    src: Path,
+    items: list[dict[str, str]],
+    chunk_size: int,
+    context_size: int,
+    project: Path,
+    project_config: dict,
+    style_rules: dict,
+    out_path: Path,
+    review_mode: str = "deep",
+    focused_sample_rate: float = 0.1,
+) -> dict:
     """Export items as chunked JSON for agent AI pass."""
-    chunks = []
+    all_chunks = []
     total = len(items)
     phase1_audit = load_phase1_audit(src)
     anomaly_count = 0
@@ -414,7 +497,7 @@ def export_ai_chunks(src: Path, items: list[dict[str, str]], chunk_size: int, co
         chunk_items = []
         for offset, it in enumerate(ck_items):
             ctx = context_text(items, start + offset, context_size)
-            anomaly = detect_phase2_anomaly(it, ctx)
+            anomaly = detect_phase2_anomaly(it, ctx, style_rules)
             if anomaly:
                 anomaly_count += 1
             chunk_items.append({
@@ -430,16 +513,47 @@ def export_ai_chunks(src: Path, items: list[dict[str, str]], chunk_size: int, co
             "context_after": ctx_after,
             "previous_chunk_tail": prev_summary,
         }
-        chunks.append(chunk_data)
+        all_chunks.append(chunk_data)
+
+    if review_mode == "deep":
+        chunks = all_chunks
+    elif review_mode == "focused":
+        rate = max(0.0, min(1.0, focused_sample_rate))
+        sample_every = max(1, round(1 / rate)) if rate > 0 else 0
+        chunks = []
+        for chunk in all_chunks:
+            has_audit = any(bool(item.get("phase1_audit")) for item in chunk["chunk_items"])
+            sampled = bool(sample_every and int(chunk["chunk_id"]) % sample_every == 0)
+            if has_audit or sampled:
+                chunks.append(chunk)
+    elif review_mode == "mechanical":
+        chunks = []
+    else:
+        raise ValueError(f"Unsupported review_mode: {review_mode}")
+
+    selected_indices = [item["index"] for chunk in chunks for item in chunk["chunk_items"]]
     payload = {
         "source": str(src),
-        "project": project,
+        "project": str(project),
+        "project_title": project_config.get("title", ""),
+        "speaker": project_config.get("speaker", ""),
+        "domain": project_config.get("domain", ""),
+        "profile_isolation": "project",
+        "context_files": resolve_context_files(project, project_config),
+        "protected_terms": load_protected_terms(project),
         "total_items": total,
+        "source_fingerprint": items_fingerprint(items),
+        "total_chunks": len(all_chunks),
+        "selected_chunk_count": len(chunks),
+        "selected_indices": selected_indices,
+        "review_mode": review_mode,
+        "focused_sample_rate": focused_sample_rate,
         "chunk_size": chunk_size,
         "context_size": context_size,
-        "phase2_task": "Audit medium/high risk Phase 1 changes first. Then audit every high-risk anomaly item marked requires_phase2_decision=true (Latin leftovers, mixed Latin/CJK, suspicious ASR terms). For every item with phase1_audit, set phase1_decision to accepted, reverted, or adjusted. Do not mark anomaly items accepted until the whole sentence is grammatical and semantically valid in context. Revert over-corrections when the original text is correct in context; then fix additional contextual errors.",
+        "phase2_task": "This project is isolated to its configured speaker/course/domain. Read trusted course context first. Audit every selected item with phase1_audit and set phase1_decision to accepted, reverted, or adjusted with a concrete reason. Legitimate foreign-language text may be accepted; do not manufacture a change merely to pass a gate. Mark unresolved items with uncertainty and a reason. Then fix additional contextual errors in selected chunks and explain every changed item.",
         "audit_item_count": len(phase1_audit),
         "phase2_anomaly_count": anomaly_count,
+        "selected_audit_item_count": sum(1 for chunk in chunks for item in chunk["chunk_items"] if item.get("phase1_audit")),
         "chunks": chunks,
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -447,18 +561,97 @@ def export_ai_chunks(src: Path, items: list[dict[str, str]], chunk_size: int, co
     return payload
 
 
+def validate_ai_payload(
+    payload: dict,
+    items: list[dict[str, str]],
+    protected_terms: list[str] | None = None,
+    manifest: dict | None = None,
+) -> None:
+    if not isinstance(payload, dict) or not isinstance(payload.get("chunks"), list):
+        raise ValueError("ai_results.json must preserve the exported top-level object and chunks array")
+    if payload.get("source_fingerprint") and payload.get("source_fingerprint") != items_fingerprint(items):
+        raise ValueError("AI result quality gate failed: source fingerprint does not match the SRT being applied")
+    if manifest is not None:
+        for key in ("source_fingerprint", "review_mode", "selected_indices", "total_chunks", "selected_chunk_count"):
+            if payload.get(key) != manifest.get(key):
+                raise ValueError(f"AI result quality gate failed: selection manifest field changed: {key}")
+    elif payload.get("review_mode"):
+        raise ValueError("AI result quality gate failed: --ai-chunks-manifest is required for review-mode payloads")
+
+    all_expected = {item["index"]: item for item in items}
+    selected = payload.get("selected_indices")
+    if isinstance(selected, list):
+        unknown_selected = [str(idx) for idx in selected if str(idx) not in all_expected]
+        if unknown_selected:
+            raise ValueError(f"AI result quality gate failed: selected_indices contains unknown indices: {unknown_selected[:10]}")
+        expected = {str(idx): all_expected[str(idx)] for idx in selected}
+    else:
+        expected = all_expected
+    seen: set[str] = set()
+    errors: list[str] = []
+    for chunk in payload["chunks"]:
+        if not isinstance(chunk, dict) or not isinstance(chunk.get("chunk_items"), list):
+            errors.append("every chunk must contain a chunk_items array")
+            continue
+        for ck_item in chunk["chunk_items"]:
+            if not isinstance(ck_item, dict):
+                errors.append("chunk item is not an object")
+                continue
+            idx = str(ck_item.get("index", ""))
+            if not idx or idx not in expected:
+                errors.append(f"unknown or missing index: {idx!r}")
+                continue
+            if idx in seen:
+                errors.append(f"duplicate index: {idx}")
+                continue
+            seen.add(idx)
+            text_value = ck_item.get("text")
+            if not isinstance(text_value, str):
+                errors.append(f"index {idx}: text must be a string")
+                continue
+            audit = ck_item.get("phase1_audit") or {}
+            decision = str(ck_item.get("phase1_decision") or (audit.get("phase1_decision") if isinstance(audit, dict) else "") or "").strip().lower()
+            context_fix = ck_item.get("new_context_fix") or {}
+            context_fix_reason = context_fix.get("reason", "") if isinstance(context_fix, dict) else ""
+            reason = str(ck_item.get("reason") or ck_item.get("note") or context_fix_reason or "").strip()
+            uncertainty = ck_item.get("uncertainty")
+            if audit:
+                if decision not in VALID_PHASE1_DECISIONS:
+                    errors.append(f"index {idx}: audited item lacks accepted/reverted/adjusted decision")
+                if not reason:
+                    errors.append(f"index {idx}: audited item lacks a contextual reason")
+            if text_value != expected[idx]["text"] and not reason:
+                errors.append(f"index {idx}: changed text lacks a reason")
+            if uncertainty and not reason:
+                errors.append(f"index {idx}: uncertainty lacks a reason")
+            for term in protected_terms or []:
+                if term in expected[idx]["text"] and term not in text_value:
+                    errors.append(f"index {idx}: protected term was removed or altered: {term}")
+            if decision == "adjusted" and text_value == expected[idx]["text"]:
+                errors.append(f"index {idx}: adjusted decision did not change text")
+    missing = sorted(set(expected) - seen, key=lambda value: int(value))
+    if missing:
+        errors.append(f"missing {len(missing)} subtitle indices; first: {', '.join(missing[:10])}")
+    if errors:
+        raise ValueError("AI result quality gate failed: " + "; ".join(errors[:30]))
+
+
 def apply_ai_chunks(
     items: list[dict[str, str]],
     ai_results_path: Path,
     src: Path,
     project: Path,
+    manifest_path: Path | None = None,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     """Apply AI-processed chunk text back onto items and return Phase 2 changes."""
     payload = json.loads(ai_results_path.read_text(encoding="utf-8-sig"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig")) if manifest_path else None
+    validate_ai_payload(payload, items, load_protected_terms(project), manifest)
     corrupt_hits: list[str] = []
     idx_map: dict[str, str] = {}
     audit_map: dict[str, dict[str, str]] = {}
     reason_map: dict[str, str] = {}
+    uncertainty_map: dict[str, bool] = {}
     for ck in payload.get("chunks", []):
         for ck_item in ck.get("chunk_items", []):
             idx = ck_item.get("index", "")
@@ -476,6 +669,7 @@ def apply_ai_chunks(
                 if isinstance(audit, dict):
                     audit_map[idx] = audit
                 reason_map[idx] = reason
+                uncertainty_map[idx] = bool(ck_item.get("uncertainty"))
                 if ck_item.get("phase1_decision"):
                     audit_map.setdefault(idx, {})["phase1_decision"] = str(ck_item.get("phase1_decision"))
     if corrupt_hits:
@@ -508,6 +702,7 @@ def apply_ai_chunks(
                 "review_class": audit.get("review_class", "C" if audit.get("requires_phase2_decision") == "true" else "B"),
                 "priority": audit.get("priority", "high" if audit.get("requires_phase2_decision") == "true" else "medium"),
                 "need_human_check": audit.get("need_human_check", "true" if audit.get("requires_phase2_decision") == "true" else "false"),
+                "requires_phase2_decision": audit.get("requires_phase2_decision", "false"),
                 "change_type": change_type,
                 "before": item["text"],
                 "after": new_text,
@@ -522,7 +717,26 @@ def apply_ai_chunks(
         elif new_text is not None:
             audit = audit_map.get(item["index"], {})
             decision = (audit.get("phase1_decision") or "").strip().lower()
-            if audit and decision in {"accepted", "accept", "accepted_phase1"}:
+            if uncertainty_map.get(item["index"]):
+                phase2_changes.append({
+                    "index": item["index"],
+                    "timestamp": item["timestamp"],
+                    "risk": "high",
+                    "review_class": "C",
+                    "priority": "high",
+                    "need_human_check": "true",
+                    "requires_phase2_decision": "true",
+                    "change_type": "uncertainty",
+                    "before": item["text"],
+                    "after": item["text"],
+                    "rules": "Agent无法仅凭文本与项目资料确认",
+                    "reason": reason_map.get(item["index"], ""),
+                    "context": audit.get("context", ""),
+                    "phase1_before": audit.get("before", ""),
+                    "phase1_after": audit.get("after", ""),
+                    "phase1_rules": audit.get("rules", ""),
+                })
+            elif audit and decision in {"accepted", "accept", "accepted_phase1"}:
                 phase2_changes.append({
                     "index": item["index"],
                     "timestamp": item["timestamp"],
@@ -530,6 +744,7 @@ def apply_ai_chunks(
                     "review_class": audit.get("review_class", "C" if audit.get("requires_phase2_decision") == "true" else "B"),
                     "priority": audit.get("priority", "high" if audit.get("requires_phase2_decision") == "true" else "medium"),
                     "need_human_check": audit.get("need_human_check", "true" if audit.get("requires_phase2_decision") == "true" else "false"),
+                    "requires_phase2_decision": audit.get("requires_phase2_decision", "false"),
                     "change_type": "accepted_phase1",
                     "before": item["text"],
                     "after": item["text"],
@@ -545,6 +760,11 @@ def apply_ai_chunks(
 
 
 def write_change_csv(path: Path, rows: list[dict[str, str]]) -> None:
+    def csv_safe(value: object) -> object:
+        if isinstance(value, str) and value.startswith(("=", "+", "-", "@", "\t", "\r")):
+            return "'" + value
+        return value
+
     with path.open("w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=[
             "index",
@@ -565,7 +785,7 @@ def write_change_csv(path: Path, rows: list[dict[str, str]]) -> None:
             "phase1_rules",
         ])
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows({key: csv_safe(value) for key, value in row.items()} for row in rows)
 
 
 def find_corrupt_output_rows(items: list[dict[str, str]], rows: list[dict[str, str]]) -> list[str]:
@@ -611,20 +831,77 @@ def main() -> int:
     parser.add_argument("--lesson", default="")
     parser.add_argument("--out-dir")
     parser.add_argument("--output-in-source", action="store_true", help="Place output in source file's parent as {src_stem}_字幕校对_{timestamp}")
-    parser.add_argument("--chunk-size", type=int, default=100)
-    parser.add_argument("--context-size", type=int, default=10)
+    parser.add_argument("--chunk-size", type=int)
+    parser.add_argument("--context-size", type=int)
+    parser.add_argument("--review-mode", choices=("deep", "focused", "mechanical"), help="Phase 2 coverage mode; defaults to project.yml or deep")
+    parser.add_argument("--focused-sample-rate", type=float, help="Deterministic sampling rate for otherwise unflagged chunks in focused mode")
     parser.add_argument("--export-ai-chunks", help="Export chunked JSON for AI pass instead of running full pipeline")
     parser.add_argument("--apply-ai-chunks", help="Apply AI-processed chunk JSON and generate artifacts")
+    parser.add_argument("--ai-chunks-manifest", help="Original immutable ai_chunks.json used to verify review selection and coverage")
     args = parser.parse_args()
 
     src = Path(args.srt)
     project = Path(args.project)
+    project_config = load_project_config(project)
+    style_rules = load_style_rules(project)
+    chunk_size = args.chunk_size or int(project_config.get("default_chunk_size", 100))
+    context_size = args.context_size or int(project_config.get("default_context_size", 10))
+    review_mode = args.review_mode or str(project_config.get("review_mode", "deep")).strip().lower()
+    focused_sample_rate = args.focused_sample_rate if args.focused_sample_rate is not None else float(project_config.get("focused_sample_rate", 0.1))
     raw, source_encoding = read_text(src)
     items, parse_errors = parse_srt(raw)
+    parse_errors.extend(structural_errors(items))
+
+    lesson_label = args.lesson or src.stem
+    stamp = datetime.now().strftime("%Y%m%d_%H%M")
+    stem = src.stem
+    for suffix in (
+        "_Phase1_机械校对",
+        "_Phase2_待人工校验",
+        "_AI校对_保时轴",
+    ):
+        stem = re.sub(re.escape(suffix) + r"$", "", stem)
+    if args.out_dir:
+        out_dir = Path(args.out_dir)
+    elif args.output_in_source:
+        out_dir = src.parent / f"{stem}_字幕校对_{stamp}"
+    else:
+        out_dir = project / "runs" / f"{stem}_{stamp}"
+
+    if parse_errors:
+        if args.export_ai_chunks:
+            raise ValueError(f"Source SRT validation failed with {len(parse_errors)} errors: {parse_errors[:10]}")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_status = out_dir / "run_status.json"
+        status = {
+            "validation": {
+                "source": str(src),
+                "source_encoding": source_encoding,
+                "source_items": len(items),
+                "parse_errors_source": len(parse_errors),
+                "errors": parse_errors,
+                "production_ready": False,
+            },
+            "outputs": {"status": str(out_status)},
+        }
+        out_status.write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(json.dumps(status, ensure_ascii=False, indent=2))
+        return 2
 
     # --- AI chunk export mode ---
     if args.export_ai_chunks:
-        export_ai_chunks(src, items, args.chunk_size, args.context_size, str(project), Path(args.export_ai_chunks))
+        export_ai_chunks(
+            src,
+            items,
+            chunk_size,
+            context_size,
+            project,
+            project_config,
+            style_rules,
+            Path(args.export_ai_chunks),
+            review_mode=review_mode,
+            focused_sample_rate=focused_sample_rate,
+        )
         return 0
 
     lexicon = load_lexicon(project)
@@ -641,9 +918,9 @@ def main() -> int:
             # Phase 2: input is already Phase-1-cleaned, skip lexicon/filler/ordinal re-application
             corrected.append(dict(item))
             continue
-        ctx = context_text(items, pos, args.context_size)
+        ctx = context_text(items, pos, context_size)
         new_text, applied, reviews = apply_lexicon(item["text"], ctx, lexicon)
-        new_text, filler_applied, filler_reviews = cleanup_fillers(new_text)
+        new_text, filler_applied, filler_reviews = cleanup_fillers(new_text, style_rules)
         applied.extend(filler_applied)
         reviews.extend(filler_reviews)
         new_text, repeat_applied, repeat_reviews = cleanup_repeated_chars(new_text)
@@ -670,7 +947,7 @@ def main() -> int:
                 "rules": combined,
                 "context": ctx,
             }
-            anomaly = detect_phase2_anomaly(out_item, ctx)
+            anomaly = detect_phase2_anomaly(out_item, ctx, style_rules)
             if anomaly:
                 row["risk"] = "high"
                 row["rules"] = "; ".join(x for x in (row.get("rules", ""), anomaly.get("rules", "")) if x)
@@ -680,7 +957,7 @@ def main() -> int:
             if reviews or row["review_class"] in {"B", "C"}:
                 review_rows.append(row)
         else:
-            anomaly = detect_phase2_anomaly(out_item, ctx)
+            anomaly = detect_phase2_anomaly(out_item, ctx, style_rules)
             if anomaly:
                 row = add_review_metadata({
                     "index": item["index"],
@@ -695,22 +972,6 @@ def main() -> int:
                 changes.append(row)
                 review_rows.append(row)
 
-    lesson_label = args.lesson or src.stem
-    stamp = datetime.now().strftime("%Y%m%d_%H%M")
-    # Clean stem: strip previous generated suffixes if re-processing.
-    stem = src.stem
-    for suffix in (
-        "_Phase1_机械校对",
-        "_Phase2_待人工校验",
-        "_AI校对_保时轴",
-    ):
-        stem = re.sub(re.escape(suffix) + r"$", "", stem)
-    if args.out_dir:
-        out_dir = Path(args.out_dir)
-    elif args.output_in_source:
-        out_dir = src.parent / f"{stem}_字幕校对_{stamp}"
-    else:
-        out_dir = project / "runs" / f"{stem}_{stamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
     if is_phase2:
         out_srt = out_dir / f"{stem}_Phase2_待人工校验.srt"
@@ -724,8 +985,16 @@ def main() -> int:
 
     # --- Apply AI chunk corrections before final output ---
     phase2_changes: list[dict[str, str]] = []
+    ai_payload_meta: dict = {}
     if args.apply_ai_chunks:
-        corrected, phase2_changes = apply_ai_chunks(corrected, Path(args.apply_ai_chunks), src, project)
+        ai_payload_meta = json.loads(Path(args.apply_ai_chunks).read_text(encoding="utf-8-sig"))
+        corrected, phase2_changes = apply_ai_chunks(
+            corrected,
+            Path(args.apply_ai_chunks),
+            src,
+            project,
+            Path(args.ai_chunks_manifest) if args.ai_chunks_manifest else None,
+        )
         corrupt_hits = find_corrupt_output_rows(corrected, phase2_changes)
         if corrupt_hits:
             preview = "; ".join(corrupt_hits[:10])
@@ -757,7 +1026,7 @@ def main() -> int:
                     "before": hit.get("text", ""),
                     "after": hit.get("text", ""),
                     "rules": rule,
-                    "context": context_text(corrected, pos, args.context_size),
+                    "context": context_text(corrected, pos, context_size),
                     "requires_phase2_decision": "true",
                 }))
     out_raw, _ = read_text(out_srt)
@@ -766,6 +1035,9 @@ def main() -> int:
         "source": str(src),
         "source_encoding": source_encoding,
         "project": str(project),
+        "speaker": project_config.get("speaker", ""),
+        "domain": project_config.get("domain", ""),
+        "profile_isolation": "project",
         "lesson": lesson_label,
         "source_items": len(items),
         "output_items": len(out_items),
@@ -776,13 +1048,24 @@ def main() -> int:
         "changed_or_review_items": len(changes),
         "review_items": len(review_rows),
         "blacklist_hits": len(blacklist_hits),
-        "chunk_size": args.chunk_size,
-        "context_size": args.context_size,
+        "chunk_size": chunk_size,
+        "context_size": context_size,
         "phase": "phase2" if is_phase2 else "phase1",
         "phase1_done": True,
         "phase2_done": is_phase2,
         "ai_pass_applied": is_phase2,
         "ai_changes_count": len(phase2_changes),
+        "production_ready": not parse_errors and not out_errors,
+        "project_config_loaded": bool(project_config),
+        "style_rules_loaded": bool(style_rules),
+        "review_mode": ai_payload_meta.get("review_mode", review_mode) if is_phase2 else review_mode,
+        "selected_chunk_count": ai_payload_meta.get("selected_chunk_count", 0) if is_phase2 else 0,
+        "total_chunks": ai_payload_meta.get("total_chunks", 0) if is_phase2 else 0,
+        "review_coverage": (
+            round(ai_payload_meta.get("selected_chunk_count", 0) / ai_payload_meta.get("total_chunks", 1), 4)
+            if is_phase2 and ai_payload_meta.get("total_chunks", 0)
+            else (0.0 if is_phase2 else None)
+        ),
     }
 
     if is_phase2:

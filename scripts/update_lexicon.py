@@ -5,7 +5,8 @@ import csv
 from pathlib import Path
 
 
-FIELDS = ["wrong", "correct", "category", "confidence", "condition", "source_lesson", "note"]
+FIELDS = ["wrong", "correct", "category", "confidence", "condition", "source_lesson", "note", "status", "verified_count", "last_verified"]
+DANGEROUS_CSV_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
 
 def read_rows(path: Path) -> list[dict[str, str]]:
@@ -31,20 +32,24 @@ def write_rows(path: Path, rows: list[dict[str, str]]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--project", required=True)
-    parser.add_argument("--feedback", required=True, help="CSV with wrong/correct/category/confidence/condition/source_lesson/note. Rows are merged only when merge_decision is empty or approved.")
+    parser.add_argument("--feedback", required=True, help="CSV with wrong/correct/category/confidence/condition/source_lesson/note. A row is merged only when merge_decision/decision is explicitly approved.")
     args = parser.parse_args()
     project = Path(args.project)
     lexicon_path = project / "lexicon.csv"
     existing = read_rows(lexicon_path)
     seen = {(r.get("wrong", ""), r.get("correct", "")) for r in existing}
     added = 0
+    skipped_unsafe = 0
     for row in read_rows(Path(args.feedback)):
-        decision = (row.get("merge_decision") or row.get("decision") or "approved").strip().lower()
-        if decision not in ("approved", "yes", "y", "merge", ""):
+        decision = (row.get("merge_decision") or row.get("decision") or "").strip().lower()
+        if decision not in ("approved", "yes", "y", "merge"):
             continue
         wrong = (row.get("wrong") or row.get("candidate_wrong") or "").strip()
         correct = (row.get("correct") or row.get("candidate_correct") or "").strip()
         if not wrong or not correct or wrong == correct:
+            continue
+        if wrong.startswith(DANGEROUS_CSV_PREFIXES) or correct.startswith(DANGEROUS_CSV_PREFIXES):
+            skipped_unsafe += 1
             continue
         key = (wrong, correct)
         if key in seen:
@@ -57,11 +62,14 @@ def main() -> int:
             "condition": row.get("condition", ""),
             "source_lesson": row.get("source_lesson", ""),
             "note": row.get("note", "manual feedback"),
+            "status": row.get("status", "candidate"),
+            "verified_count": row.get("verified_count", "1"),
+            "last_verified": row.get("last_verified", ""),
         })
         seen.add(key)
         added += 1
     write_rows(lexicon_path, existing)
-    print(f"merged {added} rows into {lexicon_path}")
+    print(f"merged {added} rows into {lexicon_path}; skipped_unsafe={skipped_unsafe}")
     return 0
 
 

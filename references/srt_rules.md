@@ -28,3 +28,5 @@ Every run should report:
 - Blacklist residues.
 
 If any structural invariant fails, the output is not production-ready.
+
+The script must stop before writing a proofread SRT when source parsing or structural validation fails. A `run_status.json` error report may still be written.

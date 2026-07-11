@@ -1,1 +1,2 @@
-﻿wrong,correct,category,confidence,condition,source_lesson,note
+wrong,correct,category,confidence,condition,source_lesson,note,status,verified_count,last_verified
+人工智会,人工智能,课程术语,auto,,示例课,稳定误识别,certified,3,2026-07-11
