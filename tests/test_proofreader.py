@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -306,6 +307,26 @@ class CliIntegrationTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertTrue((out / "run_status.json").exists())
             self.assertEqual(list(out.glob("*.srt")), [])
+
+    def test_cli_handles_legacy_windows_console_encoding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = self.make_project(root)
+            source = root / "lesson.srt"
+            source.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\n宋带绘画\n",
+                encoding="utf-8-sig",
+            )
+            env = os.environ.copy()
+            env["PYTHONIOENCODING"] = "cp1252"
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "proofread_srt.py"), "--srt", str(source), "--project", str(project), "--out-dir", str(root / "out")],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_phase2_all_reasoned_acceptances_can_complete(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -5,6 +5,7 @@ import csv
 import hashlib
 import json
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,14 @@ CORRUPT_TEXT_RE = re.compile(r"\?{4,}|�|锟")
 DEFAULT_STANDALONE_FILLERS = ("啊", "哈", "嗯", "呃", "哎", "唉", "额", "uh", "yeah", "okay", "ok", "hm", "hmm")
 DEFAULT_REVIEW_WORDS = ("这个", "那个", "那么", "其实", "就是", "对吧", "是吧", "你看", "好不好")
 VALID_PHASE1_DECISIONS = {"accepted", "reverted", "adjusted"}
+
+
+def configure_console_output() -> None:
+    """Keep CLI status output safe on legacy Windows console encodings."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(errors="backslashreplace")
 
 
 
@@ -1100,4 +1109,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    configure_console_output()
     raise SystemExit(main())
