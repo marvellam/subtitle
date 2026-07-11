@@ -1,11 +1,16 @@
 project: example-course
 title: 示例课程
 speaker: ""
+domain: ""
+review_mode: deep  # deep=全量Agent复核；focused=风险块+抽样；mechanical=只跑认证词库
+focused_sample_rate: 0.1
+profile_isolation: project
 root_dir: ""
 output_dir: runs
 output_mode: runs  # runs=project/runs/ | in_source=source_dir/{stem}_AI校对_{stamp}
 default_chunk_size: 100
 default_context_size: 10
+context_files: []  # Prefer relative paths inside this project. External paths require runtime approval.
 proofread_mode:
   preserve_index: true
   preserve_timestamp: true

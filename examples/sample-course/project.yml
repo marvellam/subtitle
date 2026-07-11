@@ -1,9 +1,16 @@
 project: sample-course
 title: sample-course
+speaker: Sample Lecturer
+domain: Artificial Intelligence
+review_mode: deep
+focused_sample_rate: 0.1
+profile_isolation: project
 description: Existing SRT subtitle proofreading project.
 output_dir: runs
 default_chunk_size: 100
 default_context_size: 10
+context_files:
+  - materials/course-outline.md
 proofread_mode:
   preserve_index: true
   preserve_timestamp: true

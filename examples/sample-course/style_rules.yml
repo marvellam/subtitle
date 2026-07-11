@@ -1,7 +1,9 @@
-speech_cleanup:
-  remove_standalone_fillers: true
-  remove_sentence_final_fillers: conservative
-  mark_discourse_words_for_review: true
+speech_fillers:
+  standalone_blank: [啊, 嗯, 呃]
+  sentence_final_remove: []
+  sentence_start_review: [这个, 那个, 那么]
+  sentence_end_review: [对吧, 是吧, 你看]
+asr_review_terms: []
 editorial_rules:
   preserve_speaker_meaning: true
   do_not_rewrite_style_aggressively: true

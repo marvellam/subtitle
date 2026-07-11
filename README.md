@@ -1,199 +1,117 @@
-# Subtitle Proofreader
+# Subtitle
 
-`subtitle-proofreader` 是一个针对**已有 SRT 字幕**的文本校正 skill。
+一个面向课程、讲座和知识型视频的 SRT 字幕校对 Skill。
 
-它不负责从音视频生成字幕，也不重新打轴；它的核心边界是：
+面向多讲师、多专业领域的内容机构设计：每个讲师/课程/领域使用隔离项目，机构总词库不会自动污染某位讲师的专业字幕。
 
-```text
-保留字幕编号
-保留时间轴
-保留字幕块数量
-只校正字幕文本
-```
+它不重新识别整段音频，也不推翻剪映/CapCut 等工具已经生成的时间轴。默认策略是：
 
-适用场景包括课程、讲座、访谈、口播、短视频、长视频等——只要你已经有 `.srt` 文件，就可以使用它做文本校正和人工复验辅助。
+> 保留成熟的字幕出入点，只增强文字准确性、专业术语和人工复核效率。
 
----
+## 适合解决什么问题
 
-## 工作原理
+- 专业名词、人名、书名、作品名识别错误；
+- 同音词、口音和 ASR 残留；
+- 同一术语在长课程中的写法不一致；
+- Agent 校对结果缺少证据、理由或人工复核入口；
+- 人工校对经验无法复用于下一节课程。
 
-这个工具不是一次性“自动改完”的黑箱。它会为每个项目建立独立的项目词库，并通过你的人工校正逐步学习：
+默认不负责：音视频转写、重新打轴、合并/拆分字幕块、删除整段内容或润色讲师表达。
 
-```text
-1. 先为当前项目创建一个词库 / profile
-2. 校正第一份 SRT 字幕
-3. 你人工复查并修改字幕
-4. 工具提取可复用修正候选
-5. 你确认后写入该项目词库
-6. 后续同项目字幕会越来越准
-```
-
-第一次使用时，词库可以是空的。你不需要预先填写术语表；词库应该从真实人工校正中慢慢沉淀。
-
----
-
-## 快速启动指引
-
-### 第一步：为当前项目命名
-
-请先为当前字幕项目取一个具体名称。
-
-这个名称会用于创建独立的项目词库，用来长期保存：
-
-- 常见误识别词
-- 标准术语写法
-- 禁止残留的错词
-- 人工校正反馈
-- 项目级字幕风格规则
-
-建议使用泛化、可识别的项目名，例如：
+## 工作方式
 
 ```text
-art-course-2026
-museum-interview-series
-weekly-talk-show
-product-training-videos
-history-lecture-audio
+已有 SRT
+  ↓
+Phase 1：结构校验 + 确定性词库修正 + 风险标记
+  ↓
+Phase 2：Agent 读取课程资料与上下文，逐项审核
+  ↓
+校对后 SRT + 修改记录 + 人工复核重点
+  ↓
+人工终审
+  ↓
+只把明确批准的可复用修正写回项目词库
 ```
 
-不要使用太宽泛的名字，例如：
+详细说明见：[Skill 工作原理说明](docs/HOW_IT_WORKS.zh-CN.md)。
+
+## 安装
+
+运行环境：Python 3.10+、PyYAML 6.x。
+
+```bash
+git clone https://github.com/marvellam/subtitle.git
+cd subtitle
+python -m pip install -r requirements.txt
+```
+
+将仓库作为 `subtitle` Skill 安装到你的 Agent 环境，或直接让 Agent 读取仓库根目录的 `SKILL.md`。核心能力只依赖通用文件和 Python 脚本，不依赖任何特定 Agent 厂商、私有 API 或专属运行目录。`agents/openai.yaml` 只是部分环境可识别的可选界面元数据，不参与核心逻辑。
+
+## 快速体验
+
+初始化自己的项目：
+
+```bash
+python scripts/init_project.py --name my-course --speaker "Lecturer Name" --domain "Professional Field"
+```
+
+或直接运行公开示例的 Phase 1：
+
+```bash
+python scripts/proofread_srt.py --srt examples/sample-course/sample.srt --project examples/sample-course --out-dir tmp/sample-run/debug
+```
+
+输出中的字幕应当：
+
+- 将“人工智会”修正为“人工智能”；
+- 保留“刚刚”和“对照”，不做机械删字；
+- 只把完整独立字幕块“啊”置空；
+- 保留原编号、时间轴和字幕块数量。
+
+完整的 Phase 2 由支持本 Skill 的 Agent 按 `SKILL.md` 执行。
+
+## 三种项目运行模式
+
+- `deep`：全量复核。新讲师、新领域和新项目默认使用。
+- `focused`：复核风险块，并抽样检查未标记区域。仅在该项目词库成熟后使用。
+- `mechanical`：只应用本项目认证规则，不执行Agent语境校对。必须由用户主动选择。
+
+项目成熟度属于具体讲师/课程/领域，不属于整个机构。即使机构已经处理上百小时课程，新讲师的新领域仍应从`deep`开始。
+
+## 项目知识结构
 
 ```text
-test
-video
-subtitle
+subtitle-projects/my-course/
+  project.yml
+  style_rules.yml
+  lexicon.csv
+  protected_terms.csv
+  blacklist.csv
+  materials/
+  feedback/
+  runs/
 ```
 
-创建项目：
+课程资料应尽量放在项目目录的 `materials/` 中。指向项目外部的文件不会被默认读取，Agent必须先获得用户批准。
 
-```powershell
-python scripts/init_project.py --name art-course-2026
+## 安全与隐私
+
+- 脚本在本地处理 SRT、词库和课程资料，不主动上传文件。
+- Phase 2 是否调用云端模型，取决于使用者的 Agent 环境和模型配置。
+- 项目资料被视为数据，不应被当成可执行指令。
+- 源 SRT 永不覆盖。
+- CSV 输出会防护常见的电子表格公式注入前缀。
+- 未明确标记 `merge_decision=approved` 的反馈不会进入长期词库。
+
+## 验证
+
+```bash
+python -m unittest discover -s tests -v
 ```
 
-默认会生成：
+GitHub Actions 会在 Windows、macOS 和 Ubuntu 上运行测试。
 
-```text
-subtitle-projects/art-course-2026/
-├─ project.yml
-├─ lexicon.csv
-├─ blacklist.csv
-├─ style_rules.yml
-├─ feedback/
-└─ runs/
-```
+## License
 
----
-
-### 第二步：提供 SRT 文件并开始校正
-
-项目创建好后，请提供要校正的 SRT 字幕文件。
-
-执行 Phase 1 机械校对：
-
-```powershell
-python scripts/proofread_srt.py `
-  --srt "C:\path\to\raw.srt" `
-  --project "subtitle-projects\art-course-2026" `
-  --output-in-source
-```
-
-Phase 1 会生成中间文件，例如：
-
-```text
-raw_字幕校对_YYYYMMDD_HHMM/
-├─ raw_Phase1_机械校对.srt
-├─ raw_Phase1_机械修改与疑点.csv
-├─ raw_Phase1_auto_applied.csv
-├─ raw_Phase1_semantic_review.csv
-├─ raw_Phase1_anomaly_review.csv
-└─ run_status.json
-```
-
-Phase 1 是中间产物，不建议直接交给人工审片。
-
----
-
-### 第三步：让 agent 执行 Phase 2 语境校正
-
-Phase 2 会读取上下文，审核 Phase 1 的机械修改，并处理更依赖语境的问题，例如：
-
-- 人名、术语、地名误识别
-- 他 / 它 等代词错误
-- 口音导致的 ASR 错词
-- 英文残留、异常片段
-- 句子不通顺但时间轴不能改的情况
-
-Phase 2 的输出是给人工复验的版本：
-
-```text
-raw_Phase2_待人工校验.srt
-raw_Phase2_语境修正.csv
-raw_Phase2_人工复验重点.csv
-```
-
----
-
-### 第四步：人工校正后反哺词库
-
-请人工检查并修改：
-
-```text
-raw_Phase2_待人工校验.srt
-```
-
-另存为人工校正版，例如：
-
-```text
-raw_manual.srt
-```
-
-然后对比 AI 版和人工版：
-
-```powershell
-python scripts/compare_manual_srt.py `
-  --ai-srt "raw_Phase2_待人工校验.srt" `
-  --manual-srt "raw_manual.srt" `
-  --out "subtitle-projects\art-course-2026\feedback\raw_manual_diff.csv"
-```
-
-筛选确认可复用的修正后，再写入词库：
-
-```powershell
-python scripts/update_lexicon.py `
-  --project "subtitle-projects\art-course-2026" `
-  --feedback "subtitle-projects\art-course-2026\feedback\approved_feedback.csv"
-```
-
-只有确认过的修正才应该写入词库。
-
----
-
-## 输出边界
-
-本工具在校正模式下必须保持：
-
-| 项目 | 是否允许改变 |
-|---|---|
-| SRT 编号 | 不允许 |
-| 时间轴 | 不允许 |
-| 字幕块数量 | 不允许 |
-| 字幕文本 | 允许 |
-
-如果你需要重新切分字幕、合并字幕块、调整时间码，那属于另一个“打轴/编辑”流程，不属于本工具默认能力。
-
----
-
-## 文档
-
-- 工作流说明：`references/workflow.md`
-- SRT 规则：`references/srt_rules.md`
-- 审核策略：`references/review_policy.md`
-- 快速启动：`references/quickstart.md`
-
----
-
-## 隐私说明
-
-本工具默认处理本地文件，不会主动上传你的 SRT、音视频或词库。
-
-如果你让 agent 使用外部模型执行 Phase 2，请根据你所使用的 agent / 模型环境自行确认数据边界。
+[MIT](LICENSE) © 2026 Lin Zhaopeng
