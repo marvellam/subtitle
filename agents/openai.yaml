@@ -1,4 +1,4 @@
 interface:
   display_name: "Subtitle 字幕校对"
-  short_description: "保留原时间轴，结合课程资料和项目词库校正 SRT，并输出聚焦的人工复核清单。"
-  default_prompt: "使用 subtitle 校对课程 SRT：保留编号和时间轴，读取项目资料与词库，输出校正字幕、修改记录和人工复核重点。"
+  short_description: "保留原时间轴，以局部校正方式修正 SRT，并拦截生成式改写。"
+  default_prompt: "使用 $subtitle 校对课程 SRT：保留编号和时间轴，只做有证据的局部文字修正；大幅替换仅作为人工建议，连续改写必须阻断。"

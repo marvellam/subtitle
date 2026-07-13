@@ -16,6 +16,10 @@ Use `review` for plausible names, foreign-language examples, pronouns, grammar p
 
 An Agent may accept the source text when evidence supports it. Quality is measured by complete, reasoned review—not by forcing a minimum number of changes.
 
+Apply contextual corrections as local substitutions only. Do not reconstruct neighboring cues, move meaning across timestamps, add inferred relationships, or improve the speaker's argument. Store a large replacement as `new_context_fix.suggested_text` while keeping `item.text` unchanged.
+
+The deterministic semantic guard must hold an isolated high-impact replacement for human review and block Phase 2 when several high-impact replacements cluster in one passage.
+
 ## Speech and repetition
 
 Blank only a whole subtitle block that exactly matches a configured standalone filler. Do not mechanically delete sentence-start discourse words. Do not mechanically collapse repeated Chinese characters.

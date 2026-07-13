@@ -194,6 +194,77 @@ class QualityGateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "selection manifest"):
             proof.validate_ai_payload(result, self.items, manifest=manifest)
 
+    def test_isolated_high_impact_change_is_held_instead_of_applied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            project.mkdir()
+            items = [
+                {"index": "1", "timestamp": "00:00:00,000 --> 00:00:01,000", "text": "局外人"},
+                {"index": "2", "timestamp": "00:00:01,000 --> 00:00:02,000", "text": "内容"},
+            ]
+            payload = {
+                "chunks": [{"chunk_items": [
+                    {"index": "1", "text": "鼠疫", "reason": "根据上下文判断书名"},
+                    {"index": "2", "text": "内容"},
+                ]}]
+            }
+            results = root / "ai_results.json"
+            results.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            corrected, rows = proof.apply_ai_chunks([dict(item) for item in items], results, root / "source.srt", project)
+            self.assertEqual(corrected[0]["text"], "局外人")
+            self.assertEqual(rows[0]["apply_status"], "held_for_review")
+            self.assertEqual(rows[0]["suggested_change"], "鼠疫")
+
+    def test_local_term_correction_is_still_applied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            project.mkdir()
+            items = [{"index": "1", "timestamp": "00:00:00,000 --> 00:00:01,000", "text": "伽缪的作品"}]
+            payload = {"chunks": [{"chunk_items": [{"index": "1", "text": "加缪的作品", "reason": "课程资料确认人名"}]}]}
+            results = root / "ai_results.json"
+            results.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            corrected, rows = proof.apply_ai_chunks([dict(item) for item in items], results, root / "source.srt", project)
+            self.assertEqual(corrected[0]["text"], "加缪的作品")
+            self.assertEqual(rows[0]["apply_status"], "applied")
+
+    def test_clustered_high_impact_changes_block_phase2(self):
+        items = []
+        chunk_items = []
+        for idx in range(1, 5):
+            items.append({
+                "index": str(idx),
+                "timestamp": f"00:00:{(idx - 1) * 10:02d},000 --> 00:00:{(idx - 1) * 10 + 2:02d},000",
+                "text": f"这是原来课程中的第{idx}段内容",
+            })
+            chunk_items.append({
+                "index": str(idx),
+                "text": f"完全不同而且重新生成的第{idx}段说法",
+                "reason": "根据上下文调整表达",
+            })
+        with self.assertRaises(proof.SemanticGuardError):
+            proof.validate_ai_payload({"chunks": [{"chunk_items": chunk_items}]}, items)
+
+    def test_human_focus_csv_puts_decision_text_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "focus.csv"
+            proof.write_human_focus_csv(path, [{
+                "index": "1",
+                "timestamp": "00:00:00,000 --> 00:00:01,000",
+                "source_text": "原文",
+                "current_srt_text": "原文",
+                "suggested_change": "建议文本",
+                "guard_reason": "改动幅度过大",
+                "reason": "需要听音频",
+                "apply_status": "held_for_review",
+            }])
+            with path.open(encoding="utf-8-sig", newline="") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(list(rows[0]), ["index", "timestamp", "原字幕", "当前SRT", "建议修改", "人工复验原因", "处理状态"])
+            self.assertEqual(rows[0]["当前SRT"], "原文")
+            self.assertEqual(rows[0]["建议修改"], "建议文本")
+
 
 class FeedbackTests(unittest.TestCase):
     def test_term_candidates_ignore_cue_resegmentation(self):
@@ -244,6 +315,24 @@ class FeedbackTests(unittest.TestCase):
             with (project / "lexicon.csv").open(encoding="utf-8-sig") as f:
                 rows = list(csv.DictReader(f))
             self.assertEqual(rows, [])
+
+    def test_manual_feedback_accepts_phase1_baseline_argument(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            baseline = root / "phase1.srt"
+            manual = root / "manual.srt"
+            baseline.write_text("1\n00:00:00,000 --> 00:00:01,000\n伽缪\n", encoding="utf-8-sig")
+            manual.write_text("1\n00:00:00,000 --> 00:00:01,000\n加缪\n", encoding="utf-8-sig")
+            out = root / "diff.csv"
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "compare_manual_srt.py"), "--baseline-srt", str(baseline), "--manual-srt", str(manual), "--out", str(out)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(out.exists())
+            self.assertTrue((root / "diff_term_candidates.csv").exists())
 
 
 class CliIntegrationTests(unittest.TestCase):
@@ -370,7 +459,44 @@ class CliIntegrationTests(unittest.TestCase):
             )
             status = json.loads((run / "run_status.json").read_text(encoding="utf-8"))
             self.assertTrue(status["validation"]["phase2_done"])
-            self.assertTrue(status["validation"]["production_ready"])
+            self.assertTrue(status["validation"]["structure_valid"])
+            self.assertTrue(status["validation"]["semantic_guard_passed"])
+            self.assertEqual(status["validation"]["delivery_status"], "ready_for_human_review")
+            self.assertNotIn("production_ready", status["validation"])
+
+    def test_phase2_rewrite_cluster_writes_no_srt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = self.make_project(root)
+            source = root / "lesson_Phase1_机械校对.srt"
+            source_items = []
+            result_items = []
+            for idx in range(1, 5):
+                start = (idx - 1) * 10
+                source_items.append(
+                    f"{idx}\n00:00:{start:02d},000 --> 00:00:{start + 2:02d},000\n这是原来课程中的第{idx}段内容"
+                )
+                result_items.append({
+                    "index": str(idx),
+                    "text": f"完全不同而且重新生成的第{idx}段说法",
+                    "reason": "根据上下文调整表达",
+                })
+            source.write_text("\n\n".join(source_items) + "\n", encoding="utf-8-sig")
+            results = root / "ai_results.json"
+            results.write_text(json.dumps({"chunks": [{"chunk_items": result_items}]}, ensure_ascii=False), encoding="utf-8")
+            out = root / "run"
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "proofread_srt.py"), "--srt", str(source), "--project", str(project), "--apply-ai-chunks", str(results), "--out-dir", str(out)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertEqual(list(out.glob("*.srt")), [])
+            self.assertTrue((out / "lesson_Phase2_人工复验重点.csv").exists())
+            status = json.loads((out / "run_status.json").read_text(encoding="utf-8"))
+            self.assertFalse(status["validation"]["semantic_guard_passed"])
+            self.assertEqual(status["validation"]["delivery_status"], "blocked")
 
     def test_init_project_creates_complete_public_schema(self):
         with tempfile.TemporaryDirectory() as tmp:

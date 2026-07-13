@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.1 - 2026-07-13
+
+### Changed
+
+- Limited Phase 2 to local corrections and added an explicit proposal path for large replacements.
+- Simplified the editor-facing review sheet to source text, current SRT text, suggested change, reason, and handling status.
+- Replaced the misleading `production_ready` flag with internal structure, semantic-guard, and delivery-status fields.
+- Changed feedback learning to compare the Phase 1/source baseline with the manual final SRT instead of trusting Phase 2 as ground truth.
+
+### Fixed
+
+- Prevented isolated high-impact rewrites from being silently written into the SRT.
+- Blocked Phase 2 delivery when high-impact edits cluster within one passage.
+- Added a regression check modeled on the multi-cue reconstruction pattern found in production use.
+
 ## 0.2.0 - 2026-07-11
 
 ### Changed

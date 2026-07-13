@@ -146,12 +146,14 @@ def write_term_candidates(path: Path, rows: list[dict[str, str]]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ai-srt", required=True)
+    baseline_group = parser.add_mutually_exclusive_group(required=True)
+    baseline_group.add_argument("--baseline-srt", dest="baseline_srt", help="Phase 1 or original SRT used as the learning baseline")
+    baseline_group.add_argument("--ai-srt", dest="baseline_srt", help="Legacy alias for --baseline-srt")
     parser.add_argument("--manual-srt", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--terms-out", help="Optional cue-independent terminology candidate CSV. Defaults next to --out.")
     args = parser.parse_args()
-    ai = parse_srt(read_text(Path(args.ai_srt)))
+    ai = parse_srt(read_text(Path(args.baseline_srt)))
     manual = parse_srt(read_text(Path(args.manual_srt)))
     pairs, ai_only, manual_only = align(ai, manual)
     rows: list[dict[str, str]] = []
