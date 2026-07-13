@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import difflib
 import hashlib
 import json
 import re
@@ -21,6 +22,14 @@ CORRUPT_TEXT_RE = re.compile(r"\?{4,}|�|锟")
 DEFAULT_STANDALONE_FILLERS = ("啊", "哈", "嗯", "呃", "哎", "唉", "额", "uh", "yeah", "okay", "ok", "hm", "hmm")
 DEFAULT_REVIEW_WORDS = ("这个", "那个", "那么", "其实", "就是", "对吧", "是吧", "你看", "好不好")
 VALID_PHASE1_DECISIONS = {"accepted", "reverted", "adjusted"}
+
+
+class SemanticGuardError(ValueError):
+    """Raised when clustered high-impact edits look like rewriting, not proofreading."""
+
+    def __init__(self, message: str, review_rows: list[dict[str, object]]):
+        super().__init__(message)
+        self.review_rows = review_rows
 
 
 def configure_console_output() -> None:
@@ -559,7 +568,7 @@ def export_ai_chunks(
         "focused_sample_rate": focused_sample_rate,
         "chunk_size": chunk_size,
         "context_size": context_size,
-        "phase2_task": "This project is isolated to its configured speaker/course/domain. Read trusted course context first. Audit every selected item with phase1_audit and set phase1_decision to accepted, reverted, or adjusted with a concrete reason. Legitimate foreign-language text may be accepted; do not manufacture a change merely to pass a gate. Mark unresolved items with uncertainty and a reason. Then fix additional contextual errors in selected chunks and explain every changed item.",
+        "phase2_task": "This project is isolated to its configured speaker/course/domain. Read trusted course context first. Proofread by local substitution only: correct recognition, spelling, punctuation, names, and terminology without reconstructing sentences, moving meaning across cues, adding inferred facts, or making speech more literary. Audit every selected item with phase1_audit and set phase1_decision to accepted, reverted, or adjusted with a concrete reason. Legitimate foreign-language text may be accepted; do not manufacture a change merely to pass a gate. When a correction would replace most of a cue or evidence is insufficient, keep item.text unchanged, set uncertainty, and store the proposal as new_context_fix.suggested_text with new_context_fix.reason instead of forcing it into the SRT.",
         "audit_item_count": len(phase1_audit),
         "phase2_anomaly_count": anomaly_count,
         "selected_audit_item_count": sum(1 for chunk in chunks for item in chunk["chunk_items"] if item.get("phase1_audit")),
@@ -568,6 +577,131 @@ def export_ai_chunks(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return payload
+
+
+GUARD_IGNORED_RE = re.compile(r"[\s，。！？、；：,.!?;:'\"“”‘’（）()\[\]【】《》〈〉—…·-]+")
+
+
+def normalize_guard_text(value: str) -> str:
+    """Ignore whitespace and punctuation when measuring semantic edit impact."""
+    return GUARD_IGNORED_RE.sub("", value)
+
+
+def text_change_metrics(before: str, after: str) -> dict[str, object]:
+    """Measure edit size without pretending to judge whether the new meaning is true."""
+    old = normalize_guard_text(before)
+    new = normalize_guard_text(after)
+    max_length = max(len(old), len(new), 1)
+    matcher = difflib.SequenceMatcher(None, old, new, autojunk=False)
+    edit_units = sum(
+        max(i2 - i1, j2 - j1)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes()
+        if tag != "equal"
+    )
+    edit_ratio = edit_units / max_length
+    length_delta_ratio = abs(len(old) - len(new)) / max_length
+    similarity = matcher.ratio()
+    high_impact = bool(old != new) and (
+        (max_length >= 3 and similarity <= 0.25)
+        or (max_length >= 6 and edit_ratio >= 0.60)
+        or (max_length >= 10 and edit_ratio >= 0.45)
+        or (max_length >= 8 and length_delta_ratio >= 0.50)
+    )
+    reasons: list[str] = []
+    if high_impact:
+        if similarity <= 0.25:
+            reasons.append("新旧文本几乎没有共同文字")
+        if edit_ratio >= 0.45:
+            reasons.append(f"文字改动比例约为 {edit_ratio:.0%}")
+        if length_delta_ratio >= 0.50:
+            reasons.append(f"长度变化约为 {length_delta_ratio:.0%}")
+    return {
+        "max_length": max_length,
+        "edit_units": edit_units,
+        "edit_ratio": round(edit_ratio, 4),
+        "length_delta_ratio": round(length_delta_ratio, 4),
+        "similarity": round(similarity, 4),
+        "high_impact": high_impact,
+        "guard_reason": "；".join(reasons) if reasons else "局部文字校正",
+    }
+
+
+def assess_semantic_changes(payload: dict, items: list[dict[str, str]]) -> tuple[dict[str, dict[str, object]], list[dict[str, object]]]:
+    """Classify individual edits and detect dense rewriting clusters.
+
+    A single high-impact edit is held for human review. A dense cluster blocks the
+    Phase 2 delivery because it is more consistent with reconstruction than SRT
+    proofreading.
+    """
+    expected = {item["index"]: item for item in items}
+    assessments: dict[str, dict[str, object]] = {}
+    for chunk in payload.get("chunks", []):
+        for ck_item in chunk.get("chunk_items", []):
+            idx = str(ck_item.get("index", ""))
+            if idx not in expected or not isinstance(ck_item.get("text"), str):
+                continue
+            before = expected[idx]["text"]
+            proposed = ck_item["text"]
+            if before == proposed:
+                continue
+            metrics = text_change_metrics(before, proposed)
+            start_ms, _ = timestamp_to_ms(expected[idx]["timestamp"])
+            context_fix = ck_item.get("new_context_fix") or {}
+            context_fix_reason = context_fix.get("reason", "") if isinstance(context_fix, dict) else ""
+            agent_reason = str(ck_item.get("reason") or ck_item.get("note") or context_fix_reason or "").strip()
+            assessments[idx] = {
+                "index": idx,
+                "timestamp": expected[idx]["timestamp"],
+                "source_text": before,
+                "proposed_text": proposed,
+                "agent_reason": agent_reason,
+                "start_ms": start_ms,
+                **metrics,
+            }
+
+    high_impact = sorted(
+        (row for row in assessments.values() if row.get("high_impact")),
+        key=lambda row: int(row["start_ms"]),
+    )
+    clustered: list[dict[str, object]] = []
+    for pos, first in enumerate(high_impact):
+        window = [
+            row for row in high_impact[pos:]
+            if int(row["start_ms"]) - int(first["start_ms"]) <= 90_000
+        ]
+        substantial = sum(1 for row in window if int(row["max_length"]) >= 8)
+        edit_units = sum(int(row["edit_units"]) for row in window)
+        if len(window) >= 4 and substantial >= 2 and edit_units >= 24:
+            clustered = window
+            break
+    return assessments, clustered
+
+
+def held_review_row(assessment: dict[str, object], *, blocked: bool = False) -> dict[str, object]:
+    source_text = str(assessment.get("source_text", ""))
+    return {
+        "index": str(assessment.get("index", "")),
+        "timestamp": str(assessment.get("timestamp", "")),
+        "risk": "high",
+        "review_class": "C",
+        "priority": "high",
+        "need_human_check": "true",
+        "requires_phase2_decision": "true",
+        "change_type": "blocked_rewrite_cluster" if blocked else "held_high_impact_suggestion",
+        "apply_status": "blocked_run" if blocked else "held_for_review",
+        "before": source_text,
+        "after": source_text,
+        "source_text": source_text,
+        "current_srt_text": source_text,
+        "suggested_change": str(assessment.get("proposed_text", "")),
+        "rules": "语义安全门：疑似生成式改写，未写入SRT",
+        "reason": str(assessment.get("agent_reason", "")),
+        "guard_reason": str(assessment.get("guard_reason", "")),
+        "context": "",
+        "phase1_before": "",
+        "phase1_after": "",
+        "phase1_rules": "",
+    }
 
 
 def validate_ai_payload(
@@ -622,6 +756,7 @@ def validate_ai_payload(
             decision = str(ck_item.get("phase1_decision") or (audit.get("phase1_decision") if isinstance(audit, dict) else "") or "").strip().lower()
             context_fix = ck_item.get("new_context_fix") or {}
             context_fix_reason = context_fix.get("reason", "") if isinstance(context_fix, dict) else ""
+            suggested_text = context_fix.get("suggested_text", "") if isinstance(context_fix, dict) else ""
             reason = str(ck_item.get("reason") or ck_item.get("note") or context_fix_reason or "").strip()
             uncertainty = ck_item.get("uncertainty")
             if audit:
@@ -633,6 +768,10 @@ def validate_ai_payload(
                 errors.append(f"index {idx}: changed text lacks a reason")
             if uncertainty and not reason:
                 errors.append(f"index {idx}: uncertainty lacks a reason")
+            if suggested_text and not isinstance(suggested_text, str):
+                errors.append(f"index {idx}: new_context_fix.suggested_text must be a string")
+            if suggested_text and not reason:
+                errors.append(f"index {idx}: suggested change lacks a reason")
             for term in protected_terms or []:
                 if term in expected[idx]["text"] and term not in text_value:
                     errors.append(f"index {idx}: protected term was removed or altered: {term}")
@@ -643,6 +782,14 @@ def validate_ai_payload(
         errors.append(f"missing {len(missing)} subtitle indices; first: {', '.join(missing[:10])}")
     if errors:
         raise ValueError("AI result quality gate failed: " + "; ".join(errors[:30]))
+    _, clustered = assess_semantic_changes(payload, items)
+    if clustered:
+        indices = ", ".join(str(row["index"]) for row in clustered[:12])
+        raise SemanticGuardError(
+            "AI result semantic guard failed: clustered high-impact rewrites detected "
+            f"within 90 seconds (indices: {indices}). No Phase2 SRT was written.",
+            [held_review_row(row, blocked=True) for row in clustered],
+        )
 
 
 def apply_ai_chunks(
@@ -656,11 +803,13 @@ def apply_ai_chunks(
     payload = json.loads(ai_results_path.read_text(encoding="utf-8-sig"))
     manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig")) if manifest_path else None
     validate_ai_payload(payload, items, load_protected_terms(project), manifest)
+    guard_assessments, _ = assess_semantic_changes(payload, items)
     corrupt_hits: list[str] = []
     idx_map: dict[str, str] = {}
     audit_map: dict[str, dict[str, str]] = {}
     reason_map: dict[str, str] = {}
     uncertainty_map: dict[str, bool] = {}
+    suggestion_map: dict[str, str] = {}
     for ck in payload.get("chunks", []):
         for ck_item in ck.get("chunk_items", []):
             idx = ck_item.get("index", "")
@@ -679,6 +828,8 @@ def apply_ai_chunks(
                     audit_map[idx] = audit
                 reason_map[idx] = reason
                 uncertainty_map[idx] = bool(ck_item.get("uncertainty"))
+                if isinstance(context_fix, dict) and isinstance(context_fix.get("suggested_text"), str):
+                    suggestion_map[idx] = context_fix.get("suggested_text", "")
                 if ck_item.get("phase1_decision"):
                     audit_map.setdefault(idx, {})["phase1_decision"] = str(ck_item.get("phase1_decision"))
     if corrupt_hits:
@@ -704,6 +855,10 @@ def apply_ai_chunks(
             else:
                 change_type = "new_context_fix"
                 rules = "AI语境修正"
+            guard = guard_assessments.get(item["index"], {})
+            if guard.get("high_impact"):
+                phase2_changes.append(held_review_row(guard))
+                continue
             phase2_changes.append({
                 "index": item["index"],
                 "timestamp": item["timestamp"],
@@ -713,10 +868,15 @@ def apply_ai_chunks(
                 "need_human_check": audit.get("need_human_check", "true" if audit.get("requires_phase2_decision") == "true" else "false"),
                 "requires_phase2_decision": audit.get("requires_phase2_decision", "false"),
                 "change_type": change_type,
+                "apply_status": "applied",
                 "before": item["text"],
                 "after": new_text,
+                "source_text": item["text"],
+                "current_srt_text": new_text,
+                "suggested_change": "",
                 "rules": rules,
                 "reason": reason_map.get(item["index"], ""),
+                "guard_reason": "局部文字校正，通过语义安全门",
                 "context": audit.get("context", ""),
                 "phase1_before": phase1_before,
                 "phase1_after": phase1_after,
@@ -726,7 +886,18 @@ def apply_ai_chunks(
         elif new_text is not None:
             audit = audit_map.get(item["index"], {})
             decision = (audit.get("phase1_decision") or "").strip().lower()
-            if uncertainty_map.get(item["index"]):
+            suggested_text = suggestion_map.get(item["index"], "")
+            if suggested_text and suggested_text != item["text"]:
+                suggestion_metrics = {
+                    "index": item["index"],
+                    "timestamp": item["timestamp"],
+                    "source_text": item["text"],
+                    "proposed_text": suggested_text,
+                    "agent_reason": reason_map.get(item["index"], ""),
+                    **text_change_metrics(item["text"], suggested_text),
+                }
+                phase2_changes.append(held_review_row(suggestion_metrics))
+            elif uncertainty_map.get(item["index"]):
                 phase2_changes.append({
                     "index": item["index"],
                     "timestamp": item["timestamp"],
@@ -736,10 +907,15 @@ def apply_ai_chunks(
                     "need_human_check": "true",
                     "requires_phase2_decision": "true",
                     "change_type": "uncertainty",
+                    "apply_status": "unchanged_uncertain",
                     "before": item["text"],
                     "after": item["text"],
+                    "source_text": item["text"],
+                    "current_srt_text": item["text"],
+                    "suggested_change": "",
                     "rules": "Agent无法仅凭文本与项目资料确认",
                     "reason": reason_map.get(item["index"], ""),
+                    "guard_reason": "证据不足，保留原文",
                     "context": audit.get("context", ""),
                     "phase1_before": audit.get("before", ""),
                     "phase1_after": audit.get("after", ""),
@@ -755,16 +931,25 @@ def apply_ai_chunks(
                     "need_human_check": audit.get("need_human_check", "true" if audit.get("requires_phase2_decision") == "true" else "false"),
                     "requires_phase2_decision": audit.get("requires_phase2_decision", "false"),
                     "change_type": "accepted_phase1",
+                    "apply_status": "applied_phase1",
                     "before": item["text"],
                     "after": item["text"],
+                    "source_text": audit.get("before", item["text"]),
+                    "current_srt_text": item["text"],
+                    "suggested_change": "",
                     "rules": "确认Phase1机械修改",
                     "reason": reason_map.get(item["index"], ""),
+                    "guard_reason": "确认已有机械修改，不新增文本",
                     "context": audit.get("context", ""),
                     "phase1_before": audit.get("before", ""),
                     "phase1_after": audit.get("after", ""),
                     "phase1_rules": audit.get("rules", ""),
                 })
-    print(json.dumps({"applied_changes": len(phase2_changes), "source": str(src)}, ensure_ascii=False, indent=2))
+    print(json.dumps({
+        "applied_changes": sum(1 for row in phase2_changes if row.get("apply_status") in {"applied", "applied_phase1"}),
+        "held_for_review": sum(1 for row in phase2_changes if row.get("apply_status") == "held_for_review"),
+        "source": str(src),
+    }, ensure_ascii=False, indent=2))
     return items, phase2_changes
 
 
@@ -784,10 +969,15 @@ def write_change_csv(path: Path, rows: list[dict[str, str]]) -> None:
             "need_human_check",
             "requires_phase2_decision",
             "change_type",
+            "apply_status",
             "before",
             "after",
+            "source_text",
+            "current_srt_text",
+            "suggested_change",
             "rules",
             "reason",
+            "guard_reason",
             "context",
             "phase1_before",
             "phase1_after",
@@ -804,7 +994,7 @@ def find_corrupt_output_rows(items: list[dict[str, str]], rows: list[dict[str, s
         if CORRUPT_TEXT_RE.search(text):
             hits.append(f"srt index={item.get('index')} text={text!r}")
     for row in rows:
-        for field in ("before", "after", "reason", "context", "phase1_before", "phase1_after", "phase1_rules"):
+        for field in ("before", "after", "source_text", "current_srt_text", "suggested_change", "reason", "guard_reason", "context", "phase1_before", "phase1_after", "phase1_rules"):
             value = row.get(field, "")
             if value and CORRUPT_TEXT_RE.search(value):
                 hits.append(f"csv index={row.get('index')} field={field} value={value!r}")
@@ -831,6 +1021,28 @@ def phase2_focus_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
         if row.get("review_class") == "C" or row.get("change_type") != "accepted_phase1":
             focus.append(row)
     return focus
+
+
+def write_human_focus_csv(path: Path, rows: list[dict[str, object]]) -> None:
+    """Write the editor-facing sheet with decision columns first and no debug noise."""
+    fieldnames = ["index", "timestamp", "原字幕", "当前SRT", "建议修改", "人工复验原因", "处理状态"]
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            source_text = str(row.get("source_text") or row.get("before") or "")
+            current_text = str(row.get("current_srt_text") or row.get("after") or source_text)
+            suggestion = str(row.get("suggested_change") or "")
+            reason_parts = [str(row.get("guard_reason") or "").strip(), str(row.get("reason") or "").strip()]
+            writer.writerow({
+                "index": row.get("index", ""),
+                "timestamp": row.get("timestamp", ""),
+                "原字幕": source_text,
+                "当前SRT": current_text,
+                "建议修改": suggestion,
+                "人工复验原因": "；".join(part for part in reason_parts if part),
+                "处理状态": row.get("apply_status", ""),
+            })
 
 
 def main() -> int:
@@ -889,7 +1101,9 @@ def main() -> int:
                 "source_items": len(items),
                 "parse_errors_source": len(parse_errors),
                 "errors": parse_errors,
-                "production_ready": False,
+                "structure_valid": False,
+                "semantic_guard_passed": None,
+                "delivery_status": "blocked",
             },
             "outputs": {"status": str(out_status)},
         }
@@ -997,13 +1211,36 @@ def main() -> int:
     ai_payload_meta: dict = {}
     if args.apply_ai_chunks:
         ai_payload_meta = json.loads(Path(args.apply_ai_chunks).read_text(encoding="utf-8-sig"))
-        corrected, phase2_changes = apply_ai_chunks(
-            corrected,
-            Path(args.apply_ai_chunks),
-            src,
-            project,
-            Path(args.ai_chunks_manifest) if args.ai_chunks_manifest else None,
-        )
+        try:
+            corrected, phase2_changes = apply_ai_chunks(
+                corrected,
+                Path(args.apply_ai_chunks),
+                src,
+                project,
+                Path(args.ai_chunks_manifest) if args.ai_chunks_manifest else None,
+            )
+        except SemanticGuardError as exc:
+            write_human_focus_csv(out_focus_csv, exc.review_rows)
+            blocked_status = {
+                "validation": {
+                    "source": str(src),
+                    "project": str(project),
+                    "source_items": len(items),
+                    "structure_valid": True,
+                    "semantic_guard_passed": False,
+                    "delivery_status": "blocked",
+                    "blocked_reason": str(exc),
+                    "blocked_review_items": len(exc.review_rows),
+                    "review_mode": ai_payload_meta.get("review_mode", review_mode),
+                },
+                "outputs": {
+                    "human_review_focus_csv": str(out_focus_csv),
+                    "status": str(out_status),
+                },
+            }
+            out_status.write_text(json.dumps(blocked_status, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(json.dumps(blocked_status, ensure_ascii=False, indent=2))
+            return 3
         corrupt_hits = find_corrupt_output_rows(corrected, phase2_changes)
         if corrupt_hits:
             preview = "; ".join(corrupt_hits[:10])
@@ -1063,8 +1300,11 @@ def main() -> int:
         "phase1_done": True,
         "phase2_done": is_phase2,
         "ai_pass_applied": is_phase2,
-        "ai_changes_count": len(phase2_changes),
-        "production_ready": not parse_errors and not out_errors,
+        "ai_changes_count": sum(1 for row in phase2_changes if row.get("apply_status") in {"applied", "applied_phase1"}),
+        "ai_held_for_review_count": sum(1 for row in phase2_changes if row.get("apply_status") == "held_for_review"),
+        "structure_valid": not parse_errors and not out_errors,
+        "semantic_guard_passed": True if is_phase2 else None,
+        "delivery_status": "ready_for_human_review" if is_phase2 else "phase1_debug",
         "project_config_loaded": bool(project_config),
         "style_rules_loaded": bool(style_rules),
         "review_mode": ai_payload_meta.get("review_mode", review_mode) if is_phase2 else review_mode,
@@ -1080,7 +1320,7 @@ def main() -> int:
     if is_phase2:
         write_change_csv(out_csv, phase2_changes)
         focus_rows = phase2_focus_rows(phase2_changes)
-        write_change_csv(out_focus_csv, focus_rows)
+        write_human_focus_csv(out_focus_csv, focus_rows)
         queue_outputs = {}
     else:
         write_change_csv(out_csv, changes)

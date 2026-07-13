@@ -30,8 +30,10 @@ Keep context files inside the project folder when possible. Treat external paths
 2. Run Phase 1 into `<run>/debug`.
 3. Export `ai_chunks.json` from the Phase 1 SRT.
 4. Read project context and audit chunks with the Agent.
-5. Apply `ai_results.json` into `<run>`; the script enforces result coverage and reasons.
+5. Apply `ai_results.json` into `<run>`; the script enforces result coverage, reasons, and the local-correction boundary.
 6. Give humans only the Phase 2 SRT, full change CSV, and focused review CSV.
+
+If one high-impact edit appears, keep the source cue in the SRT and show the Agent text only as a suggestion. If high-impact edits cluster in one passage, stop Phase 2 and deliver no SRT; provide only the focused review CSV and blocked status.
 
 Use `deep` mode for new projects, `focused` mode only after project-specific knowledge matures, and `mechanical` mode only when the user explicitly accepts certified-rule-only coverage.
 
@@ -39,7 +41,7 @@ Phase 1 is deterministic preparation, not a delivery file. Phase 2 is contextual
 
 ## Feedback loop
 
-Compare the Phase 2 SRT with the manually edited SRT. Use cue-independent `*_term_candidates.csv` for learning because editors may merge or split subtitle blocks.
+Compare the Phase 1 timing-preserving baseline (or original source SRT) with the manually edited SRT. Do not learn against Phase 2 because rejected Agent wording must never become a lexicon candidate. Use cue-independent `*_term_candidates.csv` for learning because editors may merge or split subtitle blocks.
 
 Merge only rows explicitly marked `merge_decision=approved`.
 
