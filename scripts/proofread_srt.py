@@ -23,6 +23,41 @@ DEFAULT_STANDALONE_FILLERS = ("啊", "哈", "嗯", "呃", "哎", "唉", "额", "
 DEFAULT_REVIEW_WORDS = ("这个", "那个", "那么", "其实", "就是", "对吧", "是吧", "你看", "好不好")
 VALID_PHASE1_DECISIONS = {"accepted", "reverted", "adjusted"}
 
+# Semantic guard thresholds. Fast lectures and slow interviews need different
+# sensitivity, so every value here can be overridden per project via
+# style_rules.yml -> semantic_guard. Defaults reproduce the original hardcoded
+# behavior so existing runs are unchanged.
+GUARD_DEFAULTS: dict[str, float] = {
+    "similarity_max": 0.25,
+    "edit_ratio_6": 0.60,
+    "edit_ratio_10": 0.45,
+    "length_delta_8": 0.50,
+    "cluster_window_ms": 90_000,
+    "cluster_substantial_len": 8,
+    "cluster_min_count": 4,
+    "cluster_min_substantial": 2,
+    "cluster_min_edit_units": 24,
+}
+
+
+def load_guard_config(style_rules: dict | None) -> dict[str, float]:
+    """Merge project semantic_guard overrides onto GUARD_DEFAULTS.
+
+    Only known keys are honored, and each value is coerced to the default's
+    type. A malformed or unknown override is ignored rather than weakening the
+    guard silently.
+    """
+    cfg: dict[str, float] = dict(GUARD_DEFAULTS)
+    overrides = (style_rules or {}).get("semantic_guard") or {}
+    if isinstance(overrides, dict):
+        for key, default in GUARD_DEFAULTS.items():
+            if key in overrides and overrides[key] is not None:
+                try:
+                    cfg[key] = type(default)(overrides[key])
+                except (TypeError, ValueError):
+                    continue
+    return cfg
+
 
 class SemanticGuardError(ValueError):
     """Raised when clustered high-impact edits look like rewriting, not proofreading."""
@@ -587,8 +622,9 @@ def normalize_guard_text(value: str) -> str:
     return GUARD_IGNORED_RE.sub("", value)
 
 
-def text_change_metrics(before: str, after: str) -> dict[str, object]:
+def text_change_metrics(before: str, after: str, guard: dict[str, float] | None = None) -> dict[str, object]:
     """Measure edit size without pretending to judge whether the new meaning is true."""
+    guard = guard or GUARD_DEFAULTS
     old = normalize_guard_text(before)
     new = normalize_guard_text(after)
     max_length = max(len(old), len(new), 1)
@@ -601,19 +637,23 @@ def text_change_metrics(before: str, after: str) -> dict[str, object]:
     edit_ratio = edit_units / max_length
     length_delta_ratio = abs(len(old) - len(new)) / max_length
     similarity = matcher.ratio()
+    similarity_max = guard["similarity_max"]
+    edit_ratio_6 = guard["edit_ratio_6"]
+    edit_ratio_10 = guard["edit_ratio_10"]
+    length_delta_8 = guard["length_delta_8"]
     high_impact = bool(old != new) and (
-        (max_length >= 3 and similarity <= 0.25)
-        or (max_length >= 6 and edit_ratio >= 0.60)
-        or (max_length >= 10 and edit_ratio >= 0.45)
-        or (max_length >= 8 and length_delta_ratio >= 0.50)
+        (max_length >= 3 and similarity <= similarity_max)
+        or (max_length >= 6 and edit_ratio >= edit_ratio_6)
+        or (max_length >= 10 and edit_ratio >= edit_ratio_10)
+        or (max_length >= 8 and length_delta_ratio >= length_delta_8)
     )
     reasons: list[str] = []
     if high_impact:
-        if similarity <= 0.25:
+        if similarity <= similarity_max:
             reasons.append("新旧文本几乎没有共同文字")
-        if edit_ratio >= 0.45:
+        if edit_ratio >= edit_ratio_10:
             reasons.append(f"文字改动比例约为 {edit_ratio:.0%}")
-        if length_delta_ratio >= 0.50:
+        if length_delta_ratio >= length_delta_8:
             reasons.append(f"长度变化约为 {length_delta_ratio:.0%}")
     return {
         "max_length": max_length,
@@ -626,13 +666,14 @@ def text_change_metrics(before: str, after: str) -> dict[str, object]:
     }
 
 
-def assess_semantic_changes(payload: dict, items: list[dict[str, str]]) -> tuple[dict[str, dict[str, object]], list[dict[str, object]]]:
+def assess_semantic_changes(payload: dict, items: list[dict[str, str]], guard: dict[str, float] | None = None) -> tuple[dict[str, dict[str, object]], list[dict[str, object]]]:
     """Classify individual edits and detect dense rewriting clusters.
 
     A single high-impact edit is held for human review. A dense cluster blocks the
     Phase 2 delivery because it is more consistent with reconstruction than SRT
     proofreading.
     """
+    guard = guard or GUARD_DEFAULTS
     expected = {item["index"]: item for item in items}
     assessments: dict[str, dict[str, object]] = {}
     for chunk in payload.get("chunks", []):
@@ -644,7 +685,7 @@ def assess_semantic_changes(payload: dict, items: list[dict[str, str]]) -> tuple
             proposed = ck_item["text"]
             if before == proposed:
                 continue
-            metrics = text_change_metrics(before, proposed)
+            metrics = text_change_metrics(before, proposed, guard)
             start_ms, _ = timestamp_to_ms(expected[idx]["timestamp"])
             context_fix = ck_item.get("new_context_fix") or {}
             context_fix_reason = context_fix.get("reason", "") if isinstance(context_fix, dict) else ""
@@ -663,15 +704,20 @@ def assess_semantic_changes(payload: dict, items: list[dict[str, str]]) -> tuple
         (row for row in assessments.values() if row.get("high_impact")),
         key=lambda row: int(row["start_ms"]),
     )
+    cluster_window_ms = int(guard["cluster_window_ms"])
+    cluster_substantial_len = int(guard["cluster_substantial_len"])
+    cluster_min_count = int(guard["cluster_min_count"])
+    cluster_min_substantial = int(guard["cluster_min_substantial"])
+    cluster_min_edit_units = int(guard["cluster_min_edit_units"])
     clustered: list[dict[str, object]] = []
     for pos, first in enumerate(high_impact):
         window = [
             row for row in high_impact[pos:]
-            if int(row["start_ms"]) - int(first["start_ms"]) <= 90_000
+            if int(row["start_ms"]) - int(first["start_ms"]) <= cluster_window_ms
         ]
-        substantial = sum(1 for row in window if int(row["max_length"]) >= 8)
+        substantial = sum(1 for row in window if int(row["max_length"]) >= cluster_substantial_len)
         edit_units = sum(int(row["edit_units"]) for row in window)
-        if len(window) >= 4 and substantial >= 2 and edit_units >= 24:
+        if len(window) >= cluster_min_count and substantial >= cluster_min_substantial and edit_units >= cluster_min_edit_units:
             clustered = window
             break
     return assessments, clustered
@@ -709,6 +755,7 @@ def validate_ai_payload(
     items: list[dict[str, str]],
     protected_terms: list[str] | None = None,
     manifest: dict | None = None,
+    guard: dict[str, float] | None = None,
 ) -> None:
     if not isinstance(payload, dict) or not isinstance(payload.get("chunks"), list):
         raise ValueError("ai_results.json must preserve the exported top-level object and chunks array")
@@ -730,6 +777,16 @@ def validate_ai_payload(
         expected = {str(idx): all_expected[str(idx)] for idx in selected}
     else:
         expected = all_expected
+    protocol = str(payload.get("protocol") or "").strip().lower()
+    diff_mode = protocol == "diff"
+    audit_required: set[str] = set()
+    if diff_mode and isinstance(manifest, dict):
+        for chunk in manifest.get("chunks", []):
+            if not isinstance(chunk, dict):
+                continue
+            for m_item in chunk.get("chunk_items", []):
+                if isinstance(m_item, dict) and m_item.get("phase1_audit"):
+                    audit_required.add(str(m_item.get("index", "")))
     seen: set[str] = set()
     errors: list[str] = []
     for chunk in payload["chunks"]:
@@ -777,12 +834,17 @@ def validate_ai_payload(
                     errors.append(f"index {idx}: protected term was removed or altered: {term}")
             if decision == "adjusted" and text_value == expected[idx]["text"]:
                 errors.append(f"index {idx}: adjusted decision did not change text")
-    missing = sorted(set(expected) - seen, key=lambda value: int(value))
-    if missing:
-        errors.append(f"missing {len(missing)} subtitle indices; first: {', '.join(missing[:10])}")
+    if diff_mode:
+        missing = sorted(audit_required - seen, key=lambda value: int(value))
+        if missing:
+            errors.append(f"diff protocol requires every audited index; missing {len(missing)}; first: {', '.join(missing[:10])}")
+    else:
+        missing = sorted(set(expected) - seen, key=lambda value: int(value))
+        if missing:
+            errors.append(f"missing {len(missing)} subtitle indices; first: {', '.join(missing[:10])}")
     if errors:
         raise ValueError("AI result quality gate failed: " + "; ".join(errors[:30]))
-    _, clustered = assess_semantic_changes(payload, items)
+    _, clustered = assess_semantic_changes(payload, items, guard)
     if clustered:
         indices = ", ".join(str(row["index"]) for row in clustered[:12])
         raise SemanticGuardError(
@@ -802,8 +864,9 @@ def apply_ai_chunks(
     """Apply AI-processed chunk text back onto items and return Phase 2 changes."""
     payload = json.loads(ai_results_path.read_text(encoding="utf-8-sig"))
     manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig")) if manifest_path else None
-    validate_ai_payload(payload, items, load_protected_terms(project), manifest)
-    guard_assessments, _ = assess_semantic_changes(payload, items)
+    guard = load_guard_config(load_style_rules(project))
+    validate_ai_payload(payload, items, load_protected_terms(project), manifest, guard)
+    guard_assessments, _ = assess_semantic_changes(payload, items, guard)
     corrupt_hits: list[str] = []
     idx_map: dict[str, str] = {}
     audit_map: dict[str, dict[str, str]] = {}

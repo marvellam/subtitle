@@ -177,6 +177,74 @@ class QualityGateTests(unittest.TestCase):
         }
         proof.validate_ai_payload(payload, self.items)
 
+    def test_diff_protocol_treats_absent_selected_index_as_unchanged(self):
+        fingerprint = proof.items_fingerprint(self.items)
+        manifest = {
+            "source_fingerprint": fingerprint,
+            "review_mode": "deep",
+            "selected_indices": ["1", "2"],
+            "total_chunks": 1,
+            "selected_chunk_count": 1,
+            "chunks": [{"chunk_items": [
+                {"index": "1", "text": "原文"},
+                {"index": "2", "text": "内容"},
+            ]}],
+        }
+        result = {
+            "source_fingerprint": fingerprint,
+            "review_mode": "deep",
+            "selected_indices": ["1", "2"],
+            "total_chunks": 1,
+            "selected_chunk_count": 1,
+            "protocol": "diff",
+            "chunks": [{"chunk_items": [
+                {"index": "1", "text": "改文", "reason": "课程资料确认术语"},
+            ]}],
+        }
+        proof.validate_ai_payload(result, self.items, manifest=manifest)
+
+    def test_diff_protocol_still_requires_audited_index_to_be_returned(self):
+        fingerprint = proof.items_fingerprint(self.items)
+        manifest = {
+            "source_fingerprint": fingerprint,
+            "review_mode": "deep",
+            "selected_indices": ["1", "2"],
+            "total_chunks": 1,
+            "selected_chunk_count": 1,
+            "chunks": [{"chunk_items": [
+                {"index": "1", "text": "原文", "phase1_audit": {"risk": "medium"}},
+                {"index": "2", "text": "内容"},
+            ]}],
+        }
+        result = {
+            "source_fingerprint": fingerprint,
+            "review_mode": "deep",
+            "selected_indices": ["1", "2"],
+            "total_chunks": 1,
+            "selected_chunk_count": 1,
+            "protocol": "diff",
+            "chunks": [{"chunk_items": [
+                {"index": "2", "text": "内容"},
+            ]}],
+        }
+        with self.assertRaisesRegex(ValueError, "audited"):
+            proof.validate_ai_payload(result, self.items, manifest=manifest)
+
+    def test_full_protocol_still_requires_every_selected_index(self):
+        payload = {
+            "selected_indices": ["1", "2"],
+            "chunks": [{"chunk_items": [{"index": "1", "text": "原文"}]}],
+        }
+        with self.assertRaisesRegex(ValueError, "missing"):
+            proof.validate_ai_payload(payload, self.items)
+
+    def test_project_semantic_guard_override_relaxes_high_impact(self):
+        strict = proof.text_change_metrics("局外人", "鼠疫")
+        self.assertTrue(strict["high_impact"])
+        loose = proof.load_guard_config({"semantic_guard": {"similarity_max": -1.0, "edit_ratio_6": 2.0, "edit_ratio_10": 2.0, "length_delta_8": 2.0}})
+        relaxed = proof.text_change_metrics("局外人", "鼠疫", loose)
+        self.assertFalse(relaxed["high_impact"])
+
     def test_review_selection_cannot_be_narrowed_after_export(self):
         fingerprint = proof.items_fingerprint(self.items)
         manifest = {
@@ -315,6 +383,54 @@ class FeedbackTests(unittest.TestCase):
             with (project / "lexicon.csv").open(encoding="utf-8-sig") as f:
                 rows = list(csv.DictReader(f))
             self.assertEqual(rows, [])
+
+    def test_repeated_approval_bumps_verified_count_instead_of_duplicating(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            project.mkdir()
+            feedback = Path(tmp) / "feedback.csv"
+            with feedback.open("w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=["wrong", "correct", "merge_decision"])
+                writer.writeheader()
+                writer.writerow({"wrong": "伽缪", "correct": "加缪", "merge_decision": "approved"})
+            for _ in range(3):
+                subprocess.run(
+                    [sys.executable, str(ROOT / "scripts" / "update_lexicon.py"), "--project", str(project), "--feedback", str(feedback)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            with (project / "lexicon.csv").open(encoding="utf-8-sig") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(int(rows[0]["verified_count"]), 3)
+
+    def test_promote_threshold_writes_review_file_without_auto_certifying(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            project.mkdir()
+            feedback = Path(tmp) / "feedback.csv"
+            with feedback.open("w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=["wrong", "correct", "merge_decision"])
+                writer.writeheader()
+                writer.writerow({"wrong": "伽缪", "correct": "加缪", "merge_decision": "approved"})
+            for _ in range(2):
+                subprocess.run(
+                    [sys.executable, str(ROOT / "scripts" / "update_lexicon.py"), "--project", str(project), "--feedback", str(feedback), "--promote-threshold", "2"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            review = project / "feedback" / "promotion_review.csv"
+            self.assertTrue(review.exists())
+            with review.open(encoding="utf-8-sig") as f:
+                ready = list(csv.DictReader(f))
+            self.assertEqual(len(ready), 1)
+            self.assertEqual(ready[0]["wrong"], "伽缪")
+            with (project / "lexicon.csv").open(encoding="utf-8-sig") as f:
+                lex = list(csv.DictReader(f))
+            self.assertNotEqual(lex[0]["confidence"].strip().lower(), "auto")
+            self.assertNotEqual(lex[0]["status"].strip().lower(), "certified")
 
     def test_manual_feedback_accepts_phase1_baseline_argument(self):
         with tempfile.TemporaryDirectory() as tmp:

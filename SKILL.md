@@ -154,9 +154,18 @@ Keep the original `<run>/debug/ai_chunks.json` immutable. Write the completed st
 python scripts/proofread_srt.py --srt "<run>/debug/<stem>_Phase1_机械校对.srt" --project "<project>" --apply-ai-chunks "<run>/debug/ai_results.json" --ai-chunks-manifest "<run>/debug/ai_chunks.json" --out-dir "<run>"
 ```
 
+### Full vs diff result protocol
+
+Two result protocols are supported. Both enforce the same safety gates; they differ only in how many chunk items you must return.
+
+- Full protocol (default, backward compatible): return every selected subtitle index. Omitting any selected index is rejected as `missing`. Use when you want a complete on-record audit of every reviewed cue.
+- Diff protocol (recommended for long lessons): set `"protocol": "diff"` at the top level of `ai_results.json`. Return only the items that need to be on record — changed items, items carrying a Phase 1 `phase1_audit`, `uncertainty` items, and `new_context_fix` proposals. Every selected index you omit is treated as `accepted` and unchanged. This removes the linear token cost of echoing thousands of untouched cues.
+
+The diff protocol keeps the same guarantees: it still rejects a payload that omits any index carrying a `phase1_audit` in the manifest, still requires a reason for every changed/audited/uncertain item, still verifies the manifest fingerprint and selection, and still runs the semantic guard. It only relaxes the requirement to echo untouched, unaudited cues. When in doubt, or when producing a full audit trail, keep using the full protocol.
+
 The apply command enforces the quality gate. It must reject:
 
-- missing, duplicate, or unknown indices;
+- duplicate or unknown indices; in full protocol, also any missing selected index (in diff protocol, only missing audited indices);
 - audited items without a valid decision;
 - audited or changed items without a reason;
 - `adjusted` decisions that do not change text;
@@ -171,6 +180,25 @@ The semantic gate handles isolated and clustered risk differently:
 - clustered high-impact edits within one passage: block the run and do not write a Phase 2 SRT.
 
 For focused review, the gate requires complete coverage of every selected chunk, not every unselected chunk. Record selected/total chunk counts and review coverage in `run_status.json`.
+
+### Tuning the semantic guard per project
+
+The guard thresholds are calibrated for typical lecture pacing but may over- or under-trigger for very fast talks or slow, deliberate interviews. A project may override them under `semantic_guard` in `style_rules.yml`. Unset keys keep the built-in defaults, and a malformed value is ignored rather than silently weakening the guard:
+
+```yaml
+semantic_guard:
+  similarity_max: 0.25        # a single edit below this new/old similarity is high-impact
+  edit_ratio_6: 0.60          # edit ratio that flags a cue of length >= 6
+  edit_ratio_10: 0.45         # edit ratio that flags a cue of length >= 10
+  length_delta_8: 0.50        # length change ratio that flags a cue of length >= 8
+  cluster_window_ms: 90000    # window for detecting a rewrite cluster
+  cluster_substantial_len: 8  # minimum cue length counted as substantial
+  cluster_min_count: 4        # high-impact edits in the window to consider a cluster
+  cluster_min_substantial: 2  # substantial edits required within that cluster
+  cluster_min_edit_units: 24  # total edited characters required within that cluster
+```
+
+Loosen these only for a specific, understood speaker; do not relax them globally to make more edits pass.
 
 ## Human-review output
 
@@ -226,6 +254,14 @@ Blank decisions must never be merged.
 Treat the manually reviewed SRT as truth and Phase 1 as the comparison baseline. Use Phase 2 only as an audit artifact. This prevents an Agent's rejected rewrite from becoming a lexicon candidate during feedback.
 
 New feedback enters the lexicon as `status=candidate` and `confidence=review`. Promote a rule to `status=certified` plus `confidence=auto` only after the same project has supplied enough human evidence that the wrong form has one safe correction. Record `verified_count` and `last_verified` when promoting it.
+
+When the same `wrong→correct` correction is approved again in a later lesson, `update_lexicon.py` increments its `verified_count` and refreshes `last_verified` instead of adding a duplicate row. To surface rules that have accumulated enough independent evidence, pass a promotion threshold:
+
+```bash
+python scripts/update_lexicon.py --project "<project>" --feedback "<project>/feedback/lesson_term_candidates.csv" --promote-threshold 3
+```
+
+This writes `<project>/feedback/promotion_review.csv` listing every non-certified rule whose `verified_count` has reached the threshold, with an empty `promote_decision` column. Nothing is auto-certified — a human still fills in the decision. This keeps promotion evidence-driven without forcing a from-scratch manual review each time.
 
 Classify feedback as:
 
