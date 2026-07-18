@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0 - 2026-07-18
+
+### Added
+
+- Diff-protocol Phase 2: set `protocol: "diff"` in `ai_results.json` to return only changed, audited, uncertain, or suggestion items. Omitted selected indices are treated as accepted-unchanged, cutting Agent output volume on long courses. Every Phase 1 audited index must still appear.
+- Configurable semantic guard: all guard thresholds (similarity, edit-ratio, length-delta, and rewrite-cluster window/counts) can be overridden per project via `style_rules.yml` -> `semantic_guard`. Defaults reproduce prior hardcoded behavior.
+- Semi-automatic lexicon promotion: `update_lexicon.py --promote-threshold N` bumps `verified_count` on repeatedly approved candidates and writes `feedback/promotion_review.csv` for human certification. Nothing is auto-promoted.
+
+### Changed
+
+- The apply quality gate still rejects missing indices under the full protocol; under the diff protocol it only requires changed and audited indices.
+
 ## 0.2.1 - 2026-07-13
 
 ### Changed
